@@ -748,10 +748,9 @@ elseif(CONFIG_BOARD_TYPE_GENJUTECH_S3_1_54TFT)
     set(BUILTIN_ICON_FONT font_awesome_20_4)
     set(DEFAULT_EMOJI_COLLECTION twemoji_64)
 
-#elseif(CONFIG_BOARD_TYPE_MY_ESP32S3_1_54TFT)
-#    set(BOARD_DIR "boards/my-esp32s3-1.54tft")
-#    set(BOARD_NAME "my-esp32s3-1.54tft")
-#    add_subdirectory(${BOARD_DIR})
+elseif(CONFIG_BOARD_TYPE_MY_ESP32S3_1_54TFT)
+    set(BOARD_TYPE "my-esp32s3-1.54tft")
+    set(BOARD_NAME "my-esp32s3-1.54tft")
 
 
 
@@ -1327,6 +1326,5 @@ endif()
 
 
 if (CONFIG_BOARD_TYPE_MY_ESP32S3_1_54TFT)
-    target_sources(${COMPONENT_LIB} PRIVATE boards/my-esp32s3-1.54tft/my_board.cc)
     target_include_directories(${COMPONENT_LIB} PRIVATE boards/my-esp32s3-1.54tft)
 endif()

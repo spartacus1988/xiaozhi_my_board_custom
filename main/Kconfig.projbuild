@@ -551,9 +551,10 @@ choice BOARD_TYPE
         depends on IDF_TARGET_ESP32S3
 
     config BOARD_TYPE_MY_ESP32S3_1_54TFT
-    	bool "my-esp32s3-1.54tft"
-    	select BOARD_HAS_DISPLAY
-    	select BOARD_HAS_BATTERY
+        bool "my-esp32s3-1.54tft"
+        depends on IDF_TARGET_ESP32S3
+        select BOARD_HAS_DISPLAY
+        select BOARD_HAS_BATTERY
 
 
 

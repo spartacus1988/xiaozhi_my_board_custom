@@ -2,6 +2,7 @@
 #include <vector>
 #include <functional>
 
+#include <esp_log.h>
 #include <esp_timer.h>
 #include <driver/gpio.h>
 #include <esp_adc/adc_oneshot.h>
