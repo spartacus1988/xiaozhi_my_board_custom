@@ -270,9 +270,22 @@ public:
         if (summary.empty()) summary = "No WiFi networks found";
 
         char* json_str = cJSON_PrintUnformatted(root);
-        std::string result_str(json_str);
-        cJSON_free(json_str);
         cJSON_Delete(root);
+
+        cJSON* wrapper = cJSON_CreateObject();
+        cJSON* content = cJSON_CreateArray();
+        cJSON* text = cJSON_CreateObject();
+        cJSON_AddStringToObject(text, "type", "text");
+        cJSON_AddStringToObject(text, "text", json_str);
+        cJSON_free(json_str);
+        cJSON_AddItemToArray(content, text);
+        cJSON_AddItemToObject(wrapper, "content", content);
+        cJSON_AddBoolToObject(wrapper, "isError", false);
+
+        char* wrapper_str = cJSON_PrintUnformatted(wrapper);
+        std::string result_str(wrapper_str);
+        cJSON_free(wrapper_str);
+        cJSON_Delete(wrapper);
 
         McpServer::GetInstance().SendReply(captured_id, result_str);
         ESP_LOGI(TAG, "MCP reply sent for id=%d", captured_id);
