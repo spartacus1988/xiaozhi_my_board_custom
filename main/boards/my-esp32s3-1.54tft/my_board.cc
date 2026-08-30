@@ -12,6 +12,7 @@
 #include "mcp_server.h"
 
 #include <esp_log.h>
+#include <esp_wifi.h>
 #include <esp_lcd_panel_vendor.h>
 
 #include <driver/rtc_io.h>
@@ -167,12 +168,86 @@ public:
 
     void InitializeTools() {
         auto &mcp_server = McpServer::GetInstance();
-        mcp_server.AddTool("self.system.reconfigure_wifi",
-            "End this conversation and enter WiFi configuration mode.\n"
-            "**CAUTION** You must ask the user to confirm this action.",
-            PropertyList(), [this](const PropertyList& properties) {
-                EnterWifiConfigMode();
-                return true;
+        mcp_server.AddTool("self.wifi.scan_networks",
+            "Scan all available WiFi networks nearby and return the list.\n"
+            "Returns: A list of WiFi networks with SSID, signal strength (RSSI), and encryption type.\n"
+            "Use this tool when the user wants to see available WiFi networks or check WiFi signal.",
+            PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
+                auto display = GetDisplay();
+                display->SetChatMessage("system", "Scanning WiFi networks...");
+
+                wifi_scan_config_t scan_config = {};
+                scan_config.show_hidden = false;
+                scan_config.scan_type = WIFI_SCAN_TYPE_ACTIVE;
+                scan_config.scan_time.active.min = 100;
+                scan_config.scan_time.active.max = 300;
+
+                esp_err_t err = esp_wifi_scan_start(&scan_config, true);
+                if (err != ESP_OK) {
+                    ESP_LOGE(TAG, "WiFi scan failed: %s", esp_err_to_name(err));
+                    display->SetChatMessage("system", "WiFi scan failed");
+                    return std::string("WiFi scan failed: ") + esp_err_to_name(err);
+                }
+
+                uint16_t ap_count = 0;
+                esp_wifi_scan_get_ap_num(&ap_count);
+
+                cJSON *root = cJSON_CreateArray();
+                std::string summary;
+
+                if (ap_count > 0) {
+                    wifi_ap_record_t *ap_records = new wifi_ap_record_t[ap_count];
+                    esp_wifi_scan_get_ap_records(&ap_count, ap_records);
+
+                    int displayed = 0;
+                    for (int i = 0; i < ap_count && displayed < 20; i++) {
+                        std::string ssid = reinterpret_cast<char*>(ap_records[i].ssid);
+                        if (ssid.empty()) continue;
+
+                        cJSON *net = cJSON_CreateObject();
+                        cJSON_AddStringToObject(net, "ssid", ssid.c_str());
+                        cJSON_AddNumberToObject(net, "rssi", ap_records[i].rssi);
+
+                        const char *auth = "open";
+                        if (ap_records[i].authmode == WIFI_AUTH_WEP) auth = "wep";
+                        else if (ap_records[i].authmode == WIFI_AUTH_WPA_PSK) auth = "wpa";
+                        else if (ap_records[i].authmode == WIFI_AUTH_WPA2_PSK) auth = "wpa2";
+                        else if (ap_records[i].authmode == WIFI_AUTH_WPA3_PSK) auth = "wpa3";
+                        else if (ap_records[i].authmode == WIFI_AUTH_WPA_WPA2_PSK) auth = "wpa/wpa2";
+                        cJSON_AddStringToObject(net, "auth", auth);
+                        cJSON_AddItemToArray(root, net);
+
+                        if (displayed < 8) {
+                            if (!summary.empty()) summary += ", ";
+                            summary += ssid;
+                            summary += " (";
+                            summary += std::to_string(ap_records[i].rssi);
+                            summary += "dBm)";
+                        }
+                        displayed++;
+                    }
+                    delete[] ap_records;
+
+                    if (displayed > 8) {
+                        summary += " and " + std::to_string(displayed - 8) + " more";
+                    }
+                }
+
+                char msg[128];
+                snprintf(msg, sizeof(msg), "Found %d WiFi networks", ap_count);
+                display->SetChatMessage("system", msg);
+
+                if (summary.empty()) {
+                    summary = "No WiFi networks found";
+                }
+
+                char *json_str = cJSON_PrintUnformatted(root);
+                std::string result_str(json_str);
+                cJSON_free(json_str);
+                cJSON_Delete(root);
+
+                ESP_LOGI(TAG, "WiFi scan result: %s", summary.c_str());
+                return result_str;
             });
     }
 
