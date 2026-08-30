@@ -549,12 +549,25 @@ void McpServer::DoToolCall(int id, const std::string& tool_name, const cJSON* to
 
     // Use main thread to call the tool
     auto& app = Application::GetInstance();
+    pending_tool_call_id_ = id;
+    deferred_reply_ = false;
     app.Schedule([this, id, tool_iter, arguments = std::move(arguments)]() {
         try {
-            ReplyResult(id, (*tool_iter)->Call(arguments));
+            auto result = (*tool_iter)->Call(arguments);
+            if (!deferred_reply_) {
+                ReplyResult(id, result);
+            } else {
+                ESP_LOGI(TAG, "tools/call: Reply deferred by callback, id=%d", id);
+            }
         } catch (const std::exception& e) {
             ESP_LOGE(TAG, "tools/call: %s", e.what());
             ReplyError(id, e.what());
         }
+        pending_tool_call_id_ = -1;
+        deferred_reply_ = false;
     });
+}
+
+void McpServer::SendReply(int id, const std::string& result) {
+    ReplyResult(id, result);
 }

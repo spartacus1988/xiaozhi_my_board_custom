@@ -326,6 +326,10 @@ public:
     void ParseMessage(const cJSON* json);
     void ParseMessage(const std::string& message);
 
+    int GetPendingToolCallId() const { return pending_tool_call_id_; }
+    void SendReply(int id, const std::string& result);
+    void SetDeferredReply(bool deferred) { deferred_reply_ = deferred; }
+
 private:
     McpServer();
     ~McpServer();
@@ -339,6 +343,8 @@ private:
     void DoToolCall(int id, const std::string& tool_name, const cJSON* tool_arguments);
 
     std::vector<McpTool*> tools_;
+    int pending_tool_call_id_ = -1;
+    bool deferred_reply_ = false;
 };
 
 #endif // MCP_SERVER_H
