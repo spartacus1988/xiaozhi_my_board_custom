@@ -14,6 +14,7 @@
 #include <esp_log.h>
 #include <esp_wifi.h>
 #include <wifi_manager.h>
+#include <ssid_manager.h>
 #include <esp_lcd_panel_vendor.h>
 
 #include <driver/rtc_io.h>
@@ -26,6 +27,12 @@ private:
     struct WifiScanTaskParam {
         MyBoard* self;
         int reply_id;
+    };
+
+    struct WifiConnectTaskParam {
+        int reply_id;
+        std::string ssid;
+        std::string password;
     };
 
     Button boot_button_;
@@ -294,6 +301,73 @@ public:
         vTaskDelete(nullptr);
     }
 
+    static void WifiConnectTask(void* arg) {
+        auto* param = static_cast<WifiConnectTaskParam*>(arg);
+        int captured_id = param->reply_id;
+        std::string ssid = std::move(param->ssid);
+        std::string password = std::move(param->password);
+        delete param;
+
+        ESP_LOGI(TAG, "WiFi connect task started for SSID: %s", ssid.c_str());
+
+        auto& wifi_mgr = WifiManager::GetInstance();
+
+        // Save credentials to NVS
+        auto& ssid_manager = SsidManager::GetInstance();
+        ssid_manager.AddSsid(ssid, password);
+        ESP_LOGI(TAG, "Saved SSID to NVS: %s", ssid.c_str());
+
+        // Stop current connection and reconnect with new credentials
+        wifi_mgr.StopStation();
+        vTaskDelay(pdMS_TO_TICKS(500));
+        wifi_mgr.StartStation();
+
+        // Wait for connection with 15s timeout
+        auto start_time = xTaskGetTickCount();
+        const TickType_t timeout_ticks = pdMS_TO_TICKS(15000);
+        bool connected = false;
+
+        while ((xTaskGetTickCount() - start_time) < timeout_ticks) {
+            if (wifi_mgr.IsConnected()) {
+                connected = true;
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(500));
+        }
+
+        // Build MCP reply
+        cJSON* wrapper = cJSON_CreateObject();
+        cJSON* content = cJSON_CreateArray();
+        cJSON* text = cJSON_CreateObject();
+        cJSON_AddStringToObject(text, "type", "text");
+
+        if (connected) {
+            std::string msg = "Successfully connected to " + ssid + ".";
+            cJSON_AddStringToObject(text, "text", msg.c_str());
+            ESP_LOGI(TAG, "Connected to %s", ssid.c_str());
+        } else {
+            std::string msg = "Failed to connect to " + ssid + " within 15 seconds. "
+                              "Please check the password and try again, or use captive portal at http://192.168.4.1.";
+            cJSON_AddStringToObject(text, "text", msg.c_str());
+            ESP_LOGW(TAG, "Connection to %s timed out", ssid.c_str());
+        }
+
+        cJSON_AddItemToArray(content, text);
+        cJSON_AddItemToObject(wrapper, "content", content);
+        cJSON_AddBoolToObject(wrapper, "isError", !connected);
+
+        char* wrapper_str = cJSON_PrintUnformatted(wrapper);
+        std::string result_str(wrapper_str);
+        cJSON_free(wrapper_str);
+        cJSON_Delete(wrapper);
+
+        ESP_LOGI(TAG, "MCP reply payload: %s", result_str.c_str());
+        McpServer::GetInstance().SendReply(captured_id, result_str);
+        ESP_LOGI(TAG, "MCP reply sent for id=%d", captured_id);
+
+        vTaskDelete(nullptr);
+    }
+
     void InitializeTools() {
         auto &mcp_server = McpServer::GetInstance();
         mcp_server.AddTool("self.wifi.scan_networks",
@@ -320,6 +394,46 @@ public:
                 xTaskCreatePinnedToCore(WifiScanTask, "wifi_scan", 8192, param, 24, nullptr, 0);
 
                 return std::string("WiFi scan in progress. Results will be announced shortly.");
+            });
+
+        mcp_server.AddTool("self.wifi.connect_network",
+            "Connect to a WiFi network.\n"
+            "Args:\n"
+            "  `ssid`: The name of the WiFi network to connect to.\n"
+            "  `password`: The password for the WiFi network (optional, for open networks leave empty).\n"
+            "If password is provided, the device will save it and connect directly.\n"
+            "If password is not provided, the device will open a captive portal at http://192.168.4.1 for password entry.",
+            PropertyList({
+                Property("ssid", kPropertyTypeString),
+                Property("password", kPropertyTypeString, std::string(""))
+            }),
+            [](const PropertyList& properties) -> ReturnValue {
+                auto& wifi_mgr = WifiManager::GetInstance();
+                int reply_id = McpServer::GetInstance().GetPendingToolCallId();
+                std::string ssid = properties["ssid"].value<std::string>();
+                std::string password = properties["password"].value<std::string>();
+
+                ESP_LOGI(TAG, "WiFi connect requested: ssid=%s, reply_id=%d", ssid.c_str(), reply_id);
+
+                if (!wifi_mgr.IsInitialized()) {
+                    return std::string("{\"error\":\"WiFi not initialized\"}");
+                }
+                if (ssid.empty()) {
+                    return std::string("{\"error\":\"SSID is required\"}");
+                }
+
+                if (!password.empty()) {
+                    // Password provided: save and connect directly
+                    McpServer::GetInstance().SetDeferredReply(true);
+                    auto* param = new WifiConnectTaskParam{reply_id, ssid, password};
+                    xTaskCreatePinnedToCore(WifiConnectTask, "wifi_connect", 8192, param, 24, nullptr, 0);
+                    return std::string("Connecting to " + ssid + "...");
+                } else {
+                    // No password: open captive portal
+                    auto& board = static_cast<MyBoard&>(Board::GetInstance());
+                    board.EnterWifiConfigMode();
+                    return std::string("To connect to " + ssid + ", open http://192.168.4.1 in a browser and enter the password.");
+                }
             });
     }
 
