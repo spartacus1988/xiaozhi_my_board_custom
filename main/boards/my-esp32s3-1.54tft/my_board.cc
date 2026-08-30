@@ -400,9 +400,9 @@ public:
             "Connect to a WiFi network.\n"
             "Args:\n"
             "  `ssid`: The name of the WiFi network to connect to.\n"
-            "  `password`: The password for the WiFi network (optional, for open networks leave empty).\n"
-            "If password is provided, the device will save it and connect directly.\n"
-            "If password is not provided, the device will open a captive portal at http://192.168.4.1 for password entry.",
+            "  `password`: The password for the WiFi network (optional if already saved).\n"
+            "If the network was previously connected, the device already has the password saved and will connect automatically.\n"
+            "Only ask the user for the password if the network has never been connected before.",
             PropertyList({
                 Property("ssid", kPropertyTypeString),
                 Property("password", kPropertyTypeString, std::string(""))
@@ -422,18 +422,95 @@ public:
                     return std::string("{\"error\":\"SSID is required\"}");
                 }
 
-                if (!password.empty()) {
-                    // Password provided: save and connect directly
-                    McpServer::GetInstance().SetDeferredReply(true);
-                    auto* param = new WifiConnectTaskParam{reply_id, ssid, password};
-                    xTaskCreatePinnedToCore(WifiConnectTask, "wifi_connect", 8192, param, 24, nullptr, 0);
-                    return std::string("Connecting to " + ssid + "...");
-                } else {
-                    // No password: open captive portal
-                    auto& board = static_cast<MyBoard&>(Board::GetInstance());
-                    board.EnterWifiConfigMode();
-                    return std::string("To connect to " + ssid + ", open http://192.168.4.1 in a browser and enter the password.");
+                bool used_saved = false;
+                // If no password provided, check if we have saved credentials for this SSID
+                if (password.empty()) {
+                    auto& ssid_manager = SsidManager::GetInstance();
+                    auto& ssid_list = ssid_manager.GetSsidList();
+                    for (int i = 0; i < (int)ssid_list.size(); i++) {
+                        if (ssid_list[i].ssid == ssid) {
+                            password = ssid_list[i].password;
+                            used_saved = true;
+                            ESP_LOGI(TAG, "Using saved credentials for SSID: %s", ssid.c_str());
+                            break;
+                        }
+                    }
+                    if (password.empty()) {
+                        return std::string("{\"error\":\"No saved password for " + ssid + ". Please provide the password.\"}");
+                    }
                 }
+
+                // Save and connect
+                {
+                    auto& ssid_manager = SsidManager::GetInstance();
+                    ssid_manager.AddSsid(ssid, password);
+                }
+                McpServer::GetInstance().SetDeferredReply(true);
+                auto* param = new WifiConnectTaskParam{reply_id, ssid, password};
+                xTaskCreatePinnedToCore(WifiConnectTask, "wifi_connect", 8192, param, 24, nullptr, 0);
+                if (used_saved) {
+                    return std::string("Using saved password to connect to " + ssid + "...");
+                }
+                return std::string("Connecting to " + ssid + "...");
+            });
+
+        mcp_server.AddTool("self.wifi.get_saved_networks",
+            "Get the list of WiFi networks saved on the device.\n"
+            "Returns: A list of saved WiFi network names (SSIDs).\n"
+            "Use this tool to check which networks the device remembers.",
+            PropertyList(), [](const PropertyList& properties) -> ReturnValue {
+                auto& ssid_manager = SsidManager::GetInstance();
+                auto& ssid_list = ssid_manager.GetSsidList();
+
+                if (ssid_list.empty()) {
+                    return std::string("{\"networks\":[]}");
+                }
+
+                cJSON* root = cJSON_CreateObject();
+                cJSON* networks = cJSON_CreateArray();
+                for (const auto& item : ssid_list) {
+                    cJSON* net = cJSON_CreateObject();
+                    cJSON_AddStringToObject(net, "ssid", item.ssid.c_str());
+                    cJSON_AddBoolToObject(net, "has_password", !item.password.empty());
+                    cJSON_AddItemToArray(networks, net);
+                }
+                cJSON_AddItemToObject(root, "networks", networks);
+
+                char* json_str = cJSON_PrintUnformatted(root);
+                std::string result(json_str);
+                cJSON_free(json_str);
+                cJSON_Delete(root);
+                return result;
+            });
+
+        mcp_server.AddTool("self.wifi.forget_network",
+            "Remove a saved WiFi network from the device memory.\n"
+            "Args:\n"
+            "  `ssid`: The name of the WiFi network to forget.\n"
+            "Use this tool when a saved network has the wrong password or the user no longer needs it.",
+            PropertyList({
+                Property("ssid", kPropertyTypeString)
+            }), [](const PropertyList& properties) -> ReturnValue {
+                std::string ssid = properties["ssid"].value<std::string>();
+                if (ssid.empty()) {
+                    return std::string("{\"error\":\"SSID is required\"}");
+                }
+
+                auto& ssid_manager = SsidManager::GetInstance();
+                auto& ssid_list = ssid_manager.GetSsidList();
+                bool found = false;
+                for (int i = 0; i < (int)ssid_list.size(); i++) {
+                    if (ssid_list[i].ssid == ssid) {
+                        ssid_manager.RemoveSsid(i);
+                        found = true;
+                        ESP_LOGI(TAG, "Forgot network: %s", ssid.c_str());
+                        break;
+                    }
+                }
+                if (!found) {
+                    return std::string("{\"error\":\"Network " + ssid + " not found in saved networks.\"}");
+                }
+                return std::string("{\"success\":true,\"message\":\"Network " + ssid + " has been removed from saved networks.\"}");
             });
     }
 
