@@ -287,6 +287,7 @@ public:
         cJSON_free(wrapper_str);
         cJSON_Delete(wrapper);
 
+        ESP_LOGI(TAG, "MCP reply payload: %s", result_str.c_str());
         McpServer::GetInstance().SendReply(captured_id, result_str);
         ESP_LOGI(TAG, "MCP reply sent for id=%d", captured_id);
 
