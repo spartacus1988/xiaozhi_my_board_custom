@@ -50,6 +50,7 @@ private:
     static QueueHandle_t sniffer_queue_;
     static std::vector<SnifferPacket> sniffer_log_;
     static const size_t MAX_SNIFFER_LOG = 50;
+    static int sniffer_duration_seconds_;
 
     Button boot_button_;
     Button volume_up_button_;
@@ -385,7 +386,8 @@ public:
     }
 
     static void SnifferCallback(void* recv_buf, wifi_promiscuous_pkt_type_t type) {
-        if (!sniffer_active_ || type != WIFI_PKT_DATA) return;
+        if (!sniffer_active_) return;
+        if (type != WIFI_PKT_DATA) return;
 
         auto* pkt = (wifi_promiscuous_pkt_t*)recv_buf;
         const uint8_t* frame = pkt->payload;
@@ -534,16 +536,21 @@ public:
     }
 
     static void SnifferTask(void* arg) {
-        ESP_LOGI(TAG, "Sniffer task started on channel %d", (int)(int*)arg);
-        Application::GetInstance().Alert("Sniffer", "Listening on WiFi...", "radar", Lang::Sounds::OGG_POPUP);
+        int duration_sec = (int)(uintptr_t)arg;
+        ESP_LOGI(TAG, "Sniffer task started, will run for %d seconds", duration_sec);
 
-        while (sniffer_active_) {
+        auto& app = Application::GetInstance();
+        char msg[64];
+        snprintf(msg, sizeof(msg), "Sniffer: %ds remaining...", duration_sec);
+        app.Alert("Sniffer", msg, "radar", Lang::Sounds::OGG_POPUP);
+
+        int elapsed = 0;
+        while (sniffer_active_ && elapsed < duration_sec) {
+            // Wait for packets with 1 second timeout
             SnifferPacket* pkt = nullptr;
-            if (xQueueReceive(sniffer_queue_, &pkt, pdMS_TO_TICKS(1000)) == pdTRUE && pkt) {
-                // Display on screen
-                Application::GetInstance().Alert("Network", pkt->short_info.c_str(), "wifi");
+            if (sniffer_queue_ && xQueueReceive(sniffer_queue_, &pkt, pdMS_TO_TICKS(1000)) == pdTRUE && pkt) {
+                app.Alert("Network", pkt->short_info.c_str(), "wifi");
 
-                // Store in log
                 if (sniffer_log_.size() >= MAX_SNIFFER_LOG) {
                     sniffer_log_.erase(sniffer_log_.begin());
                 }
@@ -552,9 +559,40 @@ public:
                 ESP_LOGI(TAG, "[SNIFFER] %s", pkt->description.c_str());
                 delete pkt;
             }
+            elapsed++;
+
+            // Update countdown on screen every 5 seconds
+            if (elapsed % 5 == 0 && elapsed < duration_sec) {
+                snprintf(msg, sizeof(msg), "Sniffer: %ds remaining...", duration_sec - elapsed);
+                app.Alert("Sniffer", msg, "radar");
+            }
         }
 
-        Application::GetInstance().Alert("Sniffer", "Sniffer stopped", "radar");
+        // Auto-stop: disable promiscuous, reconnect WiFi
+        sniffer_active_ = false;
+        esp_wifi_set_promiscuous(false);
+
+        if (sniffer_queue_) {
+            SnifferPacket* pkt;
+            while (xQueueReceive(sniffer_queue_, &pkt, 0) == pdTRUE) {
+                delete pkt;
+            }
+            vQueueDelete(sniffer_queue_);
+            sniffer_queue_ = nullptr;
+        }
+
+        auto& wifi_mgr = WifiManager::GetInstance();
+        wifi_mgr.SetExternalScanMode(false);
+        wifi_mgr.Reconnect();
+
+        ESP_LOGI(TAG, "Sniffer auto-stopped after %ds, %d packets captured. Reconnecting...",
+                 duration_sec, (int)sniffer_log_.size());
+
+        char result_msg[128];
+        snprintf(result_msg, sizeof(result_msg), "Sniffer done: %d packets in %ds. Reconnecting...",
+                 (int)sniffer_log_.size(), duration_sec);
+        app.Alert("Sniffer", result_msg, "radar");
+
         sniffer_task_handle_ = nullptr;
         vTaskDelete(nullptr);
     }
@@ -705,11 +743,13 @@ public:
             });
 
         mcp_server.AddTool("self.wifi.start_sniffer",
-            "Start WiFi packet sniffer in promiscuous mode.\n"
-            "Captures all WiFi traffic on the current channel and displays live packet info on screen.\n"
-            "Packets are also logged for later retrieval with self.wifi.get_sniffer_log.\n"
-            "Use when the user wants to monitor network traffic or see what devices are communicating.",
-            PropertyList(), [](const PropertyList& properties) -> ReturnValue {
+            "Start WiFi packet sniffer for a fixed duration.\n"
+            "WiFi will be disconnected during sniffing. After the duration, the sniffer auto-stops and WiFi reconnects.\n"
+            "After it finishes, use self.wifi.get_sniffer_log to see captured packets.\n"
+            "Use when the user wants to monitor network traffic.",
+            PropertyList({
+                Property("duration_seconds", kPropertyTypeInteger, 10)
+            }), [](const PropertyList& properties) -> ReturnValue {
                 if (sniffer_active_) {
                     return std::string("{\"error\":\"Sniffer is already running\"}");
                 }
@@ -719,47 +759,40 @@ public:
                     return std::string("{\"error\":\"WiFi not connected\"}");
                 }
 
-                sniffer_active_ = true;
-                sniffer_log_.clear();
-                sniffer_queue_ = xQueueCreate(32, sizeof(SnifferPacket*));
+                int duration = properties["duration_seconds"].value<int>();
+                if (duration < 3) duration = 3;
+                if (duration > 60) duration = 60;
 
-                // Get current channel
+                // Get current channel before disconnecting
                 uint8_t primary;
                 wifi_second_chan_t second;
                 esp_wifi_get_channel(&primary, &second);
 
+                // Prevent WiFi driver from auto-reconnecting
+                wifi_mgr.SetExternalScanMode(true);
+
+                // Disconnect from WiFi
+                esp_wifi_disconnect();
+
+                // Wait for disconnect to fully complete
+                vTaskDelay(pdMS_TO_TICKS(2000));
+
+                sniffer_active_ = true;
+                sniffer_log_.clear();
+                sniffer_queue_ = xQueueCreate(32, sizeof(SnifferPacket*));
+
+                // Set channel and enable promiscuous mode
+                esp_wifi_set_channel(primary, second);
+                vTaskDelay(pdMS_TO_TICKS(200));
                 esp_wifi_set_promiscuous(true);
                 esp_wifi_set_promiscuous_rx_cb(SnifferCallback);
                 esp_wifi_set_promiscuous_filter(&filter);
-                esp_wifi_set_channel(primary, second);
 
-                xTaskCreatePinnedToCore(SnifferTask, "sniffer", 4096, (void*)(uintptr_t)primary, 18, &sniffer_task_handle_, 1);
+                ESP_LOGI(TAG, "WiFi sniffer enabled on channel %d for %d seconds", primary, duration);
 
-                ESP_LOGI(TAG, "WiFi sniffer started on channel %d", primary);
-                return std::string("{\"success\":true,\"message\":\"Sniffer started on channel " + std::to_string(primary) + "\"}");
-            });
+                xTaskCreatePinnedToCore(SnifferTask, "sniffer", 4096, (void*)(uintptr_t)duration, 18, &sniffer_task_handle_, 1);
 
-        mcp_server.AddTool("self.wifi.stop_sniffer",
-            "Stop the WiFi packet sniffer.\n"
-            "Use when the user wants to stop monitoring network traffic.",
-            PropertyList(), [](const PropertyList& properties) -> ReturnValue {
-                if (!sniffer_active_) {
-                    return std::string("{\"error\":\"Sniffer is not running\"}");
-                }
-
-                sniffer_active_ = false;
-                esp_wifi_set_promiscuous(false);
-
-                // Drain queue
-                SnifferPacket* pkt;
-                while (xQueueReceive(sniffer_queue_, &pkt, 0) == pdTRUE) {
-                    delete pkt;
-                }
-                vQueueDelete(sniffer_queue_);
-                sniffer_queue_ = nullptr;
-
-                ESP_LOGI(TAG, "WiFi sniffer stopped, %d packets logged", (int)sniffer_log_.size());
-                return std::string("{\"success\":true,\"message\":\"Sniffer stopped. " + std::to_string(sniffer_log_.size()) + " packets captured.\"}");
+                return std::string("{\"success\":true,\"message\":\"Sniffer started for " + std::to_string(duration) + " seconds on channel " + std::to_string(primary) + ". WiFi will reconnect automatically after.\",\"duration\":" + std::to_string(duration) + "}");
             });
 
         mcp_server.AddTool("self.wifi.get_sniffer_log",
@@ -832,5 +865,6 @@ bool MyBoard::sniffer_active_ = false;
 TaskHandle_t MyBoard::sniffer_task_handle_ = nullptr;
 QueueHandle_t MyBoard::sniffer_queue_ = nullptr;
 std::vector<MyBoard::SnifferPacket> MyBoard::sniffer_log_;
+int MyBoard::sniffer_duration_seconds_ = 10;
 
 DECLARE_BOARD(MyBoard);
