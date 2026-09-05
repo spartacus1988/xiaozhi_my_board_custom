@@ -16,12 +16,15 @@
 #include <wifi_manager.h>
 #include <ssid_manager.h>
 #include <esp_lcd_panel_vendor.h>
+#include <nvs_flash.h>
 
 #include <driver/rtc_io.h>
 #include <esp_sleep.h>
 #include <map>
 
 #define TAG "MyBoard"
+#define NVS_SNIFFER_NAMESPACE "sniffer"
+#define MAX_SNIFFER_LOG 100
 
 static const wifi_promiscuous_filter_t filter = {
     .filter_mask = WIFI_PROMIS_FILTER_MASK_DATA
@@ -49,8 +52,75 @@ private:
     static TaskHandle_t sniffer_task_handle_;
     static QueueHandle_t sniffer_queue_;
     static std::vector<SnifferPacket> sniffer_log_;
-    static const size_t MAX_SNIFFER_LOG = 50;
     static int sniffer_duration_seconds_;
+
+    static void SaveSnifferLogToNvs() {
+        nvs_handle_t handle;
+        if (nvs_open(NVS_SNIFFER_NAMESPACE, NVS_READWRITE, &handle) != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to open NVS for sniffer log");
+            return;
+        }
+
+        // Clear old entries first
+        nvs_erase_all(handle);
+
+        // Save count
+        uint32_t count = sniffer_log_.size();
+        nvs_set_u32(handle, "count", count);
+
+        // Save each entry
+        for (int i = 0; i < (int)count; i++) {
+            std::string key = "s" + std::to_string(i);
+            std::string value = sniffer_log_[i].short_info + "|" + sniffer_log_[i].description;
+            nvs_set_str(handle, key.c_str(), value.c_str());
+        }
+
+        nvs_commit(handle);
+        nvs_close(handle);
+        ESP_LOGI(TAG, "Saved %d sniffer entries to NVS", count);
+    }
+
+    static void LoadSnifferLogFromNvs() {
+        nvs_handle_t handle;
+        if (nvs_open(NVS_SNIFFER_NAMESPACE, NVS_READONLY, &handle) != ESP_OK) {
+            ESP_LOGI(TAG, "No saved sniffer log found");
+            return;
+        }
+
+        uint32_t count = 0;
+        if (nvs_get_u32(handle, "count", &count) != ESP_OK || count == 0) {
+            nvs_close(handle);
+            return;
+        }
+
+        sniffer_log_.clear();
+        for (int i = 0; i < (int)count && i < MAX_SNIFFER_LOG; i++) {
+            std::string key = "s" + std::to_string(i);
+            char buf[512];
+            size_t len = sizeof(buf);
+            if (nvs_get_str(handle, key.c_str(), buf, &len) == ESP_OK) {
+                std::string val(buf);
+                size_t sep = val.find('|');
+                if (sep != std::string::npos) {
+                    sniffer_log_.push_back({val.substr(sep + 1), val.substr(0, sep)});
+                }
+            }
+        }
+
+        nvs_close(handle);
+        ESP_LOGI(TAG, "Loaded %d sniffer entries from NVS", (int)sniffer_log_.size());
+    }
+
+    static void ClearSnifferLogFromNvs() {
+        nvs_handle_t handle;
+        if (nvs_open(NVS_SNIFFER_NAMESPACE, NVS_READWRITE, &handle) == ESP_OK) {
+            nvs_erase_all(handle);
+            nvs_commit(handle);
+            nvs_close(handle);
+        }
+        sniffer_log_.clear();
+        ESP_LOGI(TAG, "Sniffer log cleared");
+    }
 
     Button boot_button_;
     Button volume_up_button_;
@@ -195,6 +265,9 @@ public:
         GetBacklight()->RestoreBrightness();
 
         InitializeTools();
+
+        // Load persisted sniffer log from NVS
+        LoadSnifferLogFromNvs();
     }
 
     static void WifiScanTask(void* param) {
@@ -387,7 +460,7 @@ public:
 
     static void SnifferCallback(void* recv_buf, wifi_promiscuous_pkt_type_t type) {
         if (!sniffer_active_) return;
-        if (type != WIFI_PKT_DATA) return;
+        if (type == WIFI_PKT_MISC) return;
 
         auto* pkt = (wifi_promiscuous_pkt_t*)recv_buf;
         const uint8_t* frame = pkt->payload;
@@ -395,143 +468,155 @@ public:
         int8_t rssi = pkt->rx_ctrl.rssi;
         uint8_t channel = pkt->rx_ctrl.channel;
 
-        if (len < 24) return;
+        if (len < 2) return;
 
         uint16_t frame_ctrl = frame[0] | (frame[1] << 8);
-        uint16_t data_len = 0;
-        int data_offset = 0;
-        uint8_t frame_type = (frame_ctrl >> 2) & 0x3;
         uint8_t frame_subtype = (frame_ctrl >> 4) & 0xf;
 
-        if (frame_type == 2 && (frame_subtype == 0 || frame_subtype == 8 || frame_subtype == 4)) {
-            data_len = frame[23] | (frame[22] << 8);
-            data_offset = 24;
-        } else if (frame_type == 2 && (frame_subtype == 12 || frame_subtype == 13 || frame_subtype == 15)) {
-            data_len = frame[23] | (frame[22] << 8);
-            data_offset = 26;
-        } else {
+        char sa[18] = "??:??:??:??:??:??";
+        char da[18] = "??:??:??:??:??:??";
+        char bssid[18] = "??:??:??:??:??:??";
+        if (len >= 24) {
+            snprintf(sa, sizeof(sa), "%02x:%02x:%02x:%02x:%02x:%02x", frame[10], frame[11], frame[12], frame[13], frame[14], frame[15]);
+            snprintf(da, sizeof(da), "%02x:%02x:%02x:%02x:%02x:%02x", frame[4], frame[5], frame[6], frame[7], frame[8], frame[9]);
+            snprintf(bssid, sizeof(bssid), "%02x:%02x:%02x:%02x:%02x:%02x", frame[16], frame[17], frame[18], frame[19], frame[20], frame[21]);
+        }
+
+        char desc[512] = {0};
+        char info[128] = {0};
+
+        if (type == WIFI_PKT_MGMT) {
+            if (frame_subtype == 0x08 && len > 24) {
+                // Beacon
+                char ssid[33] = {0};
+                int offset = 24;
+                while (offset + 1 < len) {
+                    uint8_t eid = frame[offset];
+                    uint8_t elen = frame[offset + 1];
+                    if (eid == 0 && elen > 0 && elen < 33) {
+                        memcpy(ssid, frame + offset + 2, elen);
+                        break;
+                    }
+                    offset += 2 + elen;
+                }
+                snprintf(info, sizeof(info), "BEACON ch%d", channel);
+                snprintf(desc, sizeof(desc), "BEACON %s \"%s\" %ddBm", sa, ssid, rssi);
+            } else if (frame_subtype == 0x04 && len > 24) {
+                // Probe Request
+                char ssid[33] = {0};
+                int offset = 24;
+                while (offset + 1 < len) {
+                    uint8_t eid = frame[offset];
+                    uint8_t elen = frame[offset + 1];
+                    if (eid == 0 && elen > 0 && elen < 33) {
+                        memcpy(ssid, frame + offset + 2, elen);
+                        break;
+                    }
+                    offset += 2 + elen;
+                }
+                snprintf(info, sizeof(info), "PROBE_REQ");
+                snprintf(desc, sizeof(desc), "PROBE_REQ %s \"%s\" %ddBm", sa, ssid, rssi);
+            } else if (frame_subtype == 0x0C) {
+                snprintf(info, sizeof(info), "DEAUTH");
+                snprintf(desc, sizeof(desc), "DEAUTH %s -> %s %ddBm", sa, da, rssi);
+            } else if (frame_subtype == 0x00) {
+                snprintf(info, sizeof(info), "ASSOC_REQ");
+                snprintf(desc, sizeof(desc), "ASSOC_REQ %s -> %s %ddBm", sa, bssid, rssi);
+            } else if (frame_subtype == 0x01) {
+                snprintf(info, sizeof(info), "ASSOC_RESP");
+                snprintf(desc, sizeof(desc), "ASSOC_RESP %s -> %s %ddBm", bssid, sa, rssi);
+            } else if (frame_subtype == 0x0B) {
+                snprintf(info, sizeof(info), "AUTH");
+                snprintf(desc, sizeof(desc), "AUTH %s -> %s %ddBm", sa, bssid, rssi);
+            } else if (frame_subtype == 0x0D) {
+                snprintf(info, sizeof(info), "DISASSOC");
+                snprintf(desc, sizeof(desc), "DISASSOC %s -> %s %ddBm", sa, da, rssi);
+            } else {
+                snprintf(info, sizeof(info), "MGMT_%02x", frame_subtype);
+                snprintf(desc, sizeof(desc), "MGMT sub=%d from=%s %ddBm", frame_subtype, sa, rssi);
+            }
+        }
+        else if (type == WIFI_PKT_DATA) {
+            if (len < 24) return;
+
+            // Try to parse LLC/SNAP + IPv4 for extra detail
+            int snap_offset = -1;
+            if (len > 24) {
+                // Find LLC/SNAP header
+                for (int i = 24; i < (int)len - 8; i++) {
+                    if (frame[i] == 0xaa && frame[i+1] == 0xaa && frame[i+2] == 0x03) {
+                        snap_offset = i;
+                        break;
+                    }
+                }
+            }
+
+            if (snap_offset >= 0) {
+                uint16_t ethertype = (frame[snap_offset + 6] << 8) | frame[snap_offset + 7];
+                int ip_offset = snap_offset + 8;
+
+                if (ethertype == 0x0800 && ip_offset + 20 <= (int)len) {
+                    // IPv4
+                    uint8_t protocol = frame[ip_offset + 9];
+                    char src_ip[16], dst_ip[16];
+                    snprintf(src_ip, sizeof(src_ip), "%d.%d.%d.%d", frame[ip_offset+12], frame[ip_offset+13], frame[ip_offset+14], frame[ip_offset+15]);
+                    snprintf(dst_ip, sizeof(dst_ip), "%d.%d.%d.%d", frame[ip_offset+16], frame[ip_offset+17], frame[ip_offset+18], frame[ip_offset+19]);
+
+                    char extra[128] = {0};
+                    int transport_offset = ip_offset + (frame[ip_offset] & 0x0f) * 4;
+
+                    if (protocol == 6 && transport_offset + 20 <= (int)len) {
+                        uint16_t sport = (frame[transport_offset] << 8) | frame[transport_offset+1];
+                        uint16_t dport = (frame[transport_offset+2] << 8) | frame[transport_offset+3];
+                        uint8_t flags = frame[transport_offset + 13];
+                        char flag_str[8] = {0};
+                        int f = 0;
+                        if (flags & 0x02) flag_str[f++] = 'S';
+                        if (flags & 0x10) flag_str[f++] = 'A';
+                        if (flags & 0x01) flag_str[f++] = 'F';
+                        if (flags & 0x04) flag_str[f++] = 'R';
+                        if (flags & 0x08) flag_str[f++] = 'P';
+                        snprintf(extra, sizeof(extra), " %s:%d->%s:%d [%s]", src_ip, sport, dst_ip, dport, flag_str);
+                        snprintf(info, sizeof(info), "TCP [%s]", flag_str);
+                    } else if (protocol == 17 && transport_offset + 8 <= (int)len) {
+                        uint16_t sport = (frame[transport_offset] << 8) | frame[transport_offset+1];
+                        uint16_t dport = (frame[transport_offset+2] << 8) | frame[transport_offset+3];
+                        snprintf(extra, sizeof(extra), " %s:%d->%s:%d", src_ip, sport, dst_ip, dport);
+                        snprintf(info, sizeof(info), "UDP");
+                        if (dport == 53 || sport == 53) {
+                            snprintf(info, sizeof(info), "DNS");
+                        }
+                    } else {
+                        snprintf(extra, sizeof(extra), " %s->%s proto=%d", src_ip, dst_ip, protocol);
+                        snprintf(info, sizeof(info), "IP_%d", protocol);
+                    }
+
+                    snprintf(desc, sizeof(desc), "DATA %s->%s [%s]%s %ddBm ch%d",
+                             sa, da, info, extra, rssi, channel);
+                } else if (ethertype == 0x0806) {
+                    snprintf(info, sizeof(info), "ARP");
+                    snprintf(desc, sizeof(desc), "ARP %s %ddBm ch%d", sa, rssi, channel);
+                } else {
+                    snprintf(info, sizeof(info), "DATA_0x%04x", ethertype);
+                    snprintf(desc, sizeof(desc), "DATA %s->%s eth=0x%04x %ddBm ch%d", sa, da, ethertype, rssi, channel);
+                }
+            } else {
+                snprintf(info, sizeof(info), "DATA");
+                snprintf(desc, sizeof(desc), "DATA %s->%s len=%d %ddBm ch%d", sa, da, len, rssi, channel);
+            }
+        }
+        else {
             return;
         }
 
-        if (data_offset + 8 > (int)len || data_len < 8) return;
+        if (desc[0] == 0) return;
 
-        // LLC/SNAP header check
-        if (frame[data_offset] != 0xaa || frame[data_offset + 1] != 0xaa || frame[data_offset + 2] != 0x03) return;
+        auto* entry = new SnifferPacket();
+        entry->description = desc;
+        entry->short_info = info;
 
-        uint16_t ethertype = (frame[data_offset + 6] << 8) | frame[data_offset + 7];
-        int ip_offset = data_offset + 8;
-
-        if (ethertype != 0x0800) return; // Only IPv4
-        if (ip_offset + 20 > (int)len) return;
-
-        // IP header parsing
-        uint8_t ip_hlen = (frame[ip_offset] & 0x0f) * 4;
-        uint8_t protocol = frame[ip_offset + 9];
-
-        char src_ip[16], dst_ip[16];
-        snprintf(src_ip, sizeof(src_ip), "%d.%d.%d.%d", frame[ip_offset+12], frame[ip_offset+13], frame[ip_offset+14], frame[ip_offset+15]);
-        snprintf(dst_ip, sizeof(dst_ip), "%d.%d.%d.%d", frame[ip_offset+16], frame[ip_offset+17], frame[ip_offset+18], frame[ip_offset+19]);
-
-        char mac_src[18], mac_dst[18];
-        snprintf(mac_src, sizeof(mac_src), "%02x:%02x:%02x:%02x:%02x:%02x", frame[10], frame[11], frame[12], frame[13], frame[14], frame[15]);
-        snprintf(mac_dst, sizeof(mac_dst), "%02x:%02x:%02x:%02x:%02x:%02x", frame[4], frame[5], frame[6], frame[7], frame[8], frame[9]);
-
-        std::string proto_name;
-        int transport_offset = ip_offset + ip_hlen;
-        std::string extra;
-
-        if (protocol == 17) {
-            proto_name = "UDP";
-            if (transport_offset + 8 <= (int)len) {
-                uint16_t sport = (frame[transport_offset] << 8) | frame[transport_offset+1];
-                uint16_t dport = (frame[transport_offset+2] << 8) | frame[transport_offset+3];
-                extra = " " + std::to_string(sport) + "->" + std::to_string(dport);
-
-                if (dport == 53 || sport == 53) {
-                    proto_name = "DNS";
-                    int dns_offset = transport_offset + 8;
-                    if (dns_offset < (int)len) {
-                        uint8_t qr = (frame[dns_offset + 2] >> 7) & 1;
-                        uint8_t qtype = frame[dns_offset + 12];
-                        if (qr == 0 && dns_offset + 13 <= (int)len) {
-                            std::string qname;
-                            int pos = dns_offset + 12;
-                            while (pos < (int)len && frame[pos] != 0 && frame[pos] < 64) {
-                                int label_len = frame[pos++];
-                                for (int j = 0; j < label_len && pos < (int)len; j++) {
-                                    qname += (char)frame[pos++];
-                                }
-                                if (frame[pos] != 0) qname += ".";
-                            }
-                            const char* qtypes[] = {"", "A", "NS", "MD", "MF", "CNAME", "SOA", "MB", "MG", "MR", "NULL", "WKS", "PTR", "HINFO", "MX", "TXT"};
-                            std::string qtype_str = (qtype < 16) ? qtypes[qtype] : "TYPE" + std::to_string(qtype);
-                            extra = " query=" + qname + " (" + qtype_str + ")";
-                        }
-                    }
-                }
-            }
-        } else if (protocol == 6) {
-            proto_name = "TCP";
-            if (transport_offset + 20 <= (int)len) {
-                uint16_t sport = (frame[transport_offset] << 8) | frame[transport_offset+1];
-                uint16_t dport = (frame[transport_offset+2] << 8) | frame[transport_offset+3];
-                uint8_t flags = frame[transport_offset + 13];
-                extra = " " + std::to_string(sport) + "->" + std::to_string(dport);
-
-                std::string flag_str;
-                if (flags & 0x02) flag_str += "SYN";
-                if (flags & 0x10) flag_str += flag_str.empty() ? "ACK" : "+ACK";
-                if (flags & 0x01) flag_str += flag_str.empty() ? "FIN" : "+FIN";
-                if (flags & 0x04) flag_str += flag_str.empty() ? "RST" : "+RST";
-                if (!flag_str.empty()) extra += " [" + flag_str + "]";
-
-                // TLS Client Hello SNI extraction
-                if (dport == 443 && flags & 0x02 && !(flags & 0x10)) {
-                    int tls_offset = transport_offset + 20;
-                    if (tls_offset + 5 <= (int)len && frame[tls_offset] == 0x16 && frame[tls_offset+1] == 0x03) {
-                        int ext_offset = tls_offset + 5 + 43;
-                        if (ext_offset + 5 <= (int)len) {
-                            uint16_t extensions_len = (frame[ext_offset] << 8) | frame[ext_offset+1];
-                            int pos = ext_offset + 2;
-                            int ext_end = pos + extensions_len;
-                            while (pos + 4 <= ext_end && pos + 4 <= (int)len) {
-                                uint16_t ext_type = (frame[pos] << 8) | frame[pos+1];
-                                uint16_t ext_len = (frame[pos+2] << 8) | frame[pos+3];
-                                if (ext_type == 0x0000) {
-                                    if (pos + 7 <= (int)len) {
-                                        uint16_t name_len = (frame[pos+5] << 8) | frame[pos+6];
-                                        std::string sni;
-                                        for (int j = 0; j < name_len && pos+7+j < (int)len; j++) {
-                                            sni += (char)frame[pos+7+j];
-                                        }
-                                        extra += " SNI=" + sni;
-                                    }
-                                    break;
-                                }
-                                pos += 4 + ext_len;
-                            }
-                        }
-                    }
-                }
-            }
-        } else if (protocol == 1) {
-            proto_name = "ICMP";
-        } else {
-            proto_name = "IP#" + std::to_string(protocol);
-        }
-
-        // Build description
-        char desc[512];
-        snprintf(desc, sizeof(desc), "%s %s -> %s %s [%s] ch%d %ddBm",
-                 mac_src, src_ip, mac_dst, dst_ip, proto_name.c_str(), channel, rssi);
-
-        SnifferPacket packet;
-        packet.description = desc;
-        packet.short_info = proto_name + " " + std::string(src_ip) + " -> " + std::string(dst_ip) + extra;
-
-        // Non-blocking send to queue
-        if (xQueueSend(sniffer_queue_, &packet, 0) != pdTRUE) {
-            // Queue full, drop packet
+        if (xQueueSend(sniffer_queue_, &entry, 0) != pdTRUE) {
+            delete entry;
         }
     }
 
@@ -568,9 +653,13 @@ public:
             }
         }
 
-        // Auto-stop: disable promiscuous, reconnect WiFi
+        // Auto-stop: disable promiscuous mode
         sniffer_active_ = false;
         esp_wifi_set_promiscuous(false);
+
+        // Re-enable WifiStation auto behavior
+        auto& wifi_mgr = WifiManager::GetInstance();
+        wifi_mgr.SetExternalScanMode(false);
 
         if (sniffer_queue_) {
             SnifferPacket* pkt;
@@ -581,15 +670,14 @@ public:
             sniffer_queue_ = nullptr;
         }
 
-        auto& wifi_mgr = WifiManager::GetInstance();
-        wifi_mgr.SetExternalScanMode(false);
-        wifi_mgr.Reconnect();
-
-        ESP_LOGI(TAG, "Sniffer auto-stopped after %ds, %d packets captured. Reconnecting...",
+        ESP_LOGI(TAG, "Sniffer auto-stopped after %ds, %d packets captured",
                  duration_sec, (int)sniffer_log_.size());
 
+        // Persist log to NVS
+        SaveSnifferLogToNvs();
+
         char result_msg[128];
-        snprintf(result_msg, sizeof(result_msg), "Sniffer done: %d packets in %ds. Reconnecting...",
+        snprintf(result_msg, sizeof(result_msg), "Sniffer done: %d packets in %ds.",
                  (int)sniffer_log_.size(), duration_sec);
         app.Alert("Sniffer", result_msg, "radar");
 
@@ -744,9 +832,10 @@ public:
 
         mcp_server.AddTool("self.wifi.start_sniffer",
             "Start WiFi packet sniffer for a fixed duration.\n"
-            "WiFi will be disconnected during sniffing. After the duration, the sniffer auto-stops and WiFi reconnects.\n"
+            "Captures WiFi management frames (beacons, probes, deauths) on the current channel while staying connected.\n"
+            "After the duration, the sniffer auto-stops.\n"
             "After it finishes, use self.wifi.get_sniffer_log to see captured packets.\n"
-            "Use when the user wants to monitor network traffic.",
+            "Use when the user wants to monitor nearby WiFi networks.",
             PropertyList({
                 Property("duration_seconds", kPropertyTypeInteger, 10)
             }), [](const PropertyList& properties) -> ReturnValue {
@@ -763,36 +852,30 @@ public:
                 if (duration < 3) duration = 3;
                 if (duration > 60) duration = 60;
 
-                // Get current channel before disconnecting
+                // Get current channel (radio is already on it)
                 uint8_t primary;
                 wifi_second_chan_t second;
                 esp_wifi_get_channel(&primary, &second);
-
-                // Prevent WiFi driver from auto-reconnecting
-                wifi_mgr.SetExternalScanMode(true);
-
-                // Disconnect from WiFi
-                esp_wifi_disconnect();
-
-                // Wait for disconnect to fully complete
-                vTaskDelay(pdMS_TO_TICKS(2000));
 
                 sniffer_active_ = true;
                 sniffer_log_.clear();
                 sniffer_queue_ = xQueueCreate(32, sizeof(SnifferPacket*));
 
-                // Set channel and enable promiscuous mode
-                esp_wifi_set_channel(primary, second);
-                vTaskDelay(pdMS_TO_TICKS(200));
-                esp_wifi_set_promiscuous(true);
-                esp_wifi_set_promiscuous_rx_cb(SnifferCallback);
-                esp_wifi_set_promiscuous_filter(&filter);
+                // Prevent WifiStation from resetting power save during sniffer
+                wifi_mgr.SetExternalScanMode(true);
 
-                ESP_LOGI(TAG, "WiFi sniffer enabled on channel %d for %d seconds", primary, duration);
+                // Enable promiscuous mode on current channel (WiFi stays connected)
+                esp_wifi_set_promiscuous_rx_cb(SnifferCallback);
+                esp_wifi_set_promiscuous(true);
+                // Don't call esp_wifi_set_channel() - fails when STA connected, already on correct channel
+                // Force radio active - must be AFTER promiscuous enable and external scan mode
+                esp_wifi_set_ps(WIFI_PS_NONE);
+
+                ESP_LOGI(TAG, "WiFi sniffer enabled on channel %d for %d seconds (connected)", primary, duration);
 
                 xTaskCreatePinnedToCore(SnifferTask, "sniffer", 4096, (void*)(uintptr_t)duration, 18, &sniffer_task_handle_, 1);
 
-                return std::string("{\"success\":true,\"message\":\"Sniffer started for " + std::to_string(duration) + " seconds on channel " + std::to_string(primary) + ". WiFi will reconnect automatically after.\",\"duration\":" + std::to_string(duration) + "}");
+                return std::string("{\"success\":true,\"message\":\"Sniffer started for " + std::to_string(duration) + " seconds on channel " + std::to_string(primary) + ". Capturing WiFi management frames.\",\"duration\":" + std::to_string(duration) + "}");
             });
 
         mcp_server.AddTool("self.wifi.get_sniffer_log",
@@ -807,8 +890,8 @@ public:
                 cJSON* root = cJSON_CreateObject();
                 cJSON* packets = cJSON_CreateArray();
 
-                // Return last 30 packets
-                size_t start = sniffer_log_.size() > 30 ? sniffer_log_.size() - 30 : 0;
+                // Return last 50 packets
+                size_t start = sniffer_log_.size() > 50 ? sniffer_log_.size() - 50 : 0;
                 for (size_t i = start; i < sniffer_log_.size(); i++) {
                     cJSON* pkt_json = cJSON_CreateObject();
                     cJSON_AddStringToObject(pkt_json, "info", sniffer_log_[i].short_info.c_str());
@@ -823,6 +906,15 @@ public:
                 cJSON_free(json_str);
                 cJSON_Delete(root);
                 return result;
+            });
+
+        mcp_server.AddTool("self.wifi.clear_sniffer_log",
+            "Clear all saved sniffer log entries from device memory.\n"
+            "Use this when the user wants to delete the captured traffic log.",
+            PropertyList(), [](const PropertyList& properties) -> ReturnValue {
+                int count = sniffer_log_.size();
+                ClearSnifferLogFromNvs();
+                return std::string("{\"success\":true,\"message\":\"Cleared " + std::to_string(count) + " sniffer log entries.\"}");
             });
     }
 
