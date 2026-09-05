@@ -18,6 +18,8 @@
 #include <esp_lcd_panel_vendor.h>
 #include <nvs_flash.h>
 #include <esp_heap_caps.h>
+#include <nvs_flash.h>
+#include <esp_partition.h>
 
 #include <driver/rtc_io.h>
 #include <esp_sleep.h>
@@ -979,6 +981,23 @@ public:
                 cJSON_AddNumberToObject(summary, "free_heap", esp_get_free_heap_size());
                 cJSON_AddNumberToObject(summary, "min_free_heap", esp_get_minimum_free_heap_size());
                 cJSON_AddItemToObject(root, "heap_summary", summary);
+
+                // NVS (Non-Volatile Storage)
+                cJSON* nvs_json = cJSON_CreateObject();
+                nvs_stats_t nvs_stats;
+                if (nvs_get_stats(NULL, &nvs_stats) == ESP_OK) {
+                    cJSON_AddNumberToObject(nvs_json, "total_entries", nvs_stats.total_entries);
+                    cJSON_AddNumberToObject(nvs_json, "used_entries", nvs_stats.used_entries);
+                    cJSON_AddNumberToObject(nvs_json, "free_entries", nvs_stats.free_entries);
+                    cJSON_AddNumberToObject(nvs_json, "usage_pct", nvs_stats.total_entries > 0 ?
+                        (int)(nvs_stats.used_entries * 100 / nvs_stats.total_entries) : 0);
+                }
+                const esp_partition_t* nvs_part = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_NVS, NULL);
+                if (nvs_part) {
+                    cJSON_AddNumberToObject(nvs_json, "partition_size", nvs_part->size);
+                    cJSON_AddStringToObject(nvs_json, "partition_label", nvs_part->label);
+                }
+                cJSON_AddItemToObject(root, "nvs", nvs_json);
 
                 // Top task stacks
                 cJSON* tasks = cJSON_CreateArray();
