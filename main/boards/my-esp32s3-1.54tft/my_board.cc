@@ -485,7 +485,7 @@ public:
             snprintf(bssid, sizeof(bssid), "%02x:%02x:%02x:%02x:%02x:%02x", frame[16], frame[17], frame[18], frame[19], frame[20], frame[21]);
         }
 
-        char desc[512] = {0};
+        char desc[1024] = {0};
         char info[128] = {0};
 
         if (type == WIFI_PKT_MGMT) {
@@ -565,7 +565,8 @@ public:
                     snprintf(src_ip, sizeof(src_ip), "%d.%d.%d.%d", frame[ip_offset+12], frame[ip_offset+13], frame[ip_offset+14], frame[ip_offset+15]);
                     snprintf(dst_ip, sizeof(dst_ip), "%d.%d.%d.%d", frame[ip_offset+16], frame[ip_offset+17], frame[ip_offset+18], frame[ip_offset+19]);
 
-                    char extra[128] = {0};
+                    char extra[256] = {0};
+                    std::string extra_str;
                     int transport_offset = ip_offset + (frame[ip_offset] & 0x0f) * 4;
 
                     if (protocol == 6 && transport_offset + 20 <= (int)len) {
@@ -585,17 +586,106 @@ public:
                         uint16_t sport = (frame[transport_offset] << 8) | frame[transport_offset+1];
                         uint16_t dport = (frame[transport_offset+2] << 8) | frame[transport_offset+3];
                         snprintf(extra, sizeof(extra), " %s:%d->%s:%d", src_ip, sport, dst_ip, dport);
-                        snprintf(info, sizeof(info), "UDP");
-                        if (dport == 53 || sport == 53) {
-                            snprintf(info, sizeof(info), "DNS");
+
+                        int udp_payload = transport_offset + 8;
+
+                        if ((dport == 53 || sport == 53) && udp_payload + 12 <= (int)len) {
+                            // DNS packet
+                            uint16_t dns_flags = (frame[udp_payload+2] << 8) | frame[udp_payload+3];
+                            uint16_t ancount = (frame[udp_payload+6] << 8) | frame[udp_payload+7];
+                            bool is_response = (dns_flags >> 15) & 1;
+
+                            char dns_name[256] = {0};
+                            int pos = udp_payload + 12;
+
+                            // Parse query name
+                            for (int label = 0; label < 128 && pos < (int)len; label++) {
+                                uint8_t label_len = frame[pos];
+                                if (label_len == 0) { pos++; break; }
+                                if (label_len > 63 || pos + 1 + label_len > (int)len) break;
+                                if (label > 0 && strlen(dns_name) < sizeof(dns_name) - 1) {
+                                    strcat(dns_name, ".");
+                                }
+                                int copy_len = label_len;
+                                if (strlen(dns_name) + label_len >= sizeof(dns_name) - 1) {
+                                    copy_len = sizeof(dns_name) - 2 - strlen(dns_name);
+                                }
+                                if (copy_len > 0) {
+                                    strncat(dns_name, (const char*)(frame + pos + 1), copy_len);
+                                }
+                                pos += 1 + label_len;
+                            }
+
+                            // Skip query type and class
+                            if (is_response) {
+                                // Parse answers to get resolved IPs
+                                pos += 4; // skip type + class in question
+                                char resolved_ips[256] = {0};
+                                for (int a = 0; a < ancount && a < 10 && pos + 10 <= (int)len; a++) {
+                                    // Skip name (could be pointer)
+                                    if ((frame[pos] & 0xC0) == 0xC0) {
+                                        pos += 2;
+                                    } else {
+                                        while (pos < (int)len && frame[pos] != 0) pos++;
+                                        pos++;
+                                    }
+                                    if (pos + 10 > (int)len) break;
+                                    uint16_t rr_type = (frame[pos] << 8) | frame[pos+1];
+                                    // uint16_t rr_len = (frame[pos+8] << 8) | frame[pos+9];
+                                    pos += 10; // type(2) + class(2) + ttl(4) + rdlen(2)
+
+                                    if (rr_type == 1 && pos + 4 <= (int)len) {
+                                        // A record
+                                        char a_ip[16];
+                                        snprintf(a_ip, sizeof(a_ip), "%d.%d.%d.%d", frame[pos], frame[pos+1], frame[pos+2], frame[pos+3]);
+                                        if (resolved_ips[0]) strcat(resolved_ips, ", ");
+                                        strcat(resolved_ips, a_ip);
+                                        pos += 4;
+                                    } else if (rr_type == 28 && pos + 16 <= (int)len) {
+                                        // AAAA record (skip)
+                                        pos += 16;
+                                    } else {
+                                        uint16_t rdlen = (frame[pos-2] << 8) | frame[pos-1];
+                                        pos += rdlen;
+                                    }
+                                }
+
+                                snprintf(info, sizeof(info), "DNS_RESP");
+                                if (dns_name[0] && resolved_ips[0]) {
+                                    extra_str = std::string(" ") + src_ip + " -> " + dns_name + " [" + resolved_ips + "]";
+                                } else if (dns_name[0]) {
+                                    extra_str = std::string(" ") + src_ip + " -> " + dns_name;
+                                }
+                            } else {
+                                // DNS query
+                                snprintf(info, sizeof(info), "DNS_QUERY");
+                                if (dns_name[0]) {
+                                    uint16_t qtype = (frame[pos] << 8) | frame[pos+1];
+                                    const char* type_str = "A";
+                                    if (qtype == 28) type_str = "AAAA";
+                                    else if (qtype == 12) type_str = "PTR";
+                                    else if (qtype == 5) type_str = "CNAME";
+                                    else if (qtype == 15) type_str = "MX";
+                                    else if (qtype == 16) type_str = "TXT";
+                                    extra_str = std::string(" ") + src_ip + " -> " + dns_name + " (" + type_str + ")";
+                                }
+                            }
+                        } else if (dport == 5353 || sport == 5353) {
+                            snprintf(info, sizeof(info), "mDNS");
+                        } else {
+                            snprintf(info, sizeof(info), "UDP");
                         }
                     } else {
                         snprintf(extra, sizeof(extra), " %s->%s proto=%d", src_ip, dst_ip, protocol);
                         snprintf(info, sizeof(info), "IP_%d", protocol);
                     }
 
-                    snprintf(desc, sizeof(desc), "DATA %s->%s [%s]%s %ddBm ch%d",
-                             sa, da, info, extra, rssi, channel);
+                    // Build desc with string to avoid format-truncation
+                    {
+                        std::string extra_part = extra_str.empty() ? extra : extra_str;
+                        std::string d = std::string("DATA ") + sa + "->" + da + " [" + info + "]" + extra_part + " " + std::to_string(rssi) + "dBm ch" + std::to_string(channel);
+                        snprintf(desc, sizeof(desc), "%s", d.c_str());
+                    }
                 } else if (ethertype == 0x0806) {
                     snprintf(info, sizeof(info), "ARP");
                     snprintf(desc, sizeof(desc), "ARP %s %ddBm ch%d", sa, rssi, channel);
