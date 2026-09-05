@@ -20,6 +20,7 @@
 #include <esp_heap_caps.h>
 #include <nvs_flash.h>
 #include <esp_partition.h>
+#include <lwip/dns.h>
 
 #include <driver/rtc_io.h>
 #include <esp_sleep.h>
@@ -52,10 +53,19 @@ private:
     };
 
     static bool sniffer_active_;
+    static bool sniffer_disconnected_;
     static TaskHandle_t sniffer_task_handle_;
     static QueueHandle_t sniffer_queue_;
     static std::vector<SnifferPacket> sniffer_log_;
     static int sniffer_duration_seconds_;
+
+public:
+    struct DnsQuery {
+        uint32_t timestamp_sec;
+        std::string hostname;
+    };
+    static std::vector<DnsQuery> dns_log_;
+    static constexpr size_t MAX_DNS_LOG = 50;
 
     static void SaveSnifferLogToNvs() {
         nvs_handle_t handle;
@@ -754,6 +764,12 @@ public:
         auto& wifi_mgr = WifiManager::GetInstance();
         wifi_mgr.SetExternalScanMode(false);
 
+        // Reconnect if we were in disconnected mode
+        if (sniffer_disconnected_) {
+            sniffer_disconnected_ = false;
+            wifi_mgr.Reconnect();
+        }
+
         if (sniffer_queue_) {
             SnifferPacket* pkt;
             while (xQueueReceive(sniffer_queue_, &pkt, 0) == pdTRUE) {
@@ -925,12 +941,13 @@ public:
 
         mcp_server.AddTool("self.wifi.start_sniffer",
             "Start WiFi packet sniffer for a fixed duration.\n"
-            "Captures WiFi management frames (beacons, probes, deauths) on the current channel while staying connected.\n"
-            "After the duration, the sniffer auto-stops.\n"
-            "After it finishes, use self.wifi.get_sniffer_log to see captured packets.\n"
-            "Use when the user wants to monitor nearby WiFi networks.",
+            "Default: captures WiFi management frames while staying connected.\n"
+            "With disconnected=true: disconnects WiFi to capture ALL traffic including DNS queries from other devices.\n"
+            "After the duration, the sniffer auto-stops and WiFi reconnects.\n"
+            "After it finishes, use self.wifi.get_sniffer_log to see captured packets.",
             PropertyList({
-                Property("duration_seconds", kPropertyTypeInteger, 10)
+                Property("duration_seconds", kPropertyTypeInteger, 10),
+                Property("disconnected", kPropertyTypeBoolean, false)
             }), [](const PropertyList& properties) -> ReturnValue {
                 if (sniffer_active_) {
                     return std::string("{\"error\":\"Sniffer is already running\"}");
@@ -944,8 +961,9 @@ public:
                 int duration = properties["duration_seconds"].value<int>();
                 if (duration < 3) duration = 3;
                 if (duration > 60) duration = 60;
+                bool disconnected = properties["disconnected"].value<bool>();
 
-                // Get current channel (radio is already on it)
+                // Get current channel
                 uint8_t primary;
                 wifi_second_chan_t second;
                 esp_wifi_get_channel(&primary, &second);
@@ -954,21 +972,34 @@ public:
                 sniffer_log_.clear();
                 sniffer_queue_ = xQueueCreate(32, sizeof(SnifferPacket*));
 
-                // Prevent WifiStation from resetting power save during sniffer
-                wifi_mgr.SetExternalScanMode(true);
+                if (disconnected) {
+                    // Disconnect mode: captures ALL traffic on channel
+                    sniffer_disconnected_ = true;
+                    wifi_mgr.SetExternalScanMode(true);
+                    esp_wifi_disconnect();
+                    vTaskDelay(pdMS_TO_TICKS(1500));
 
-                // Enable promiscuous mode on current channel (WiFi stays connected)
-                esp_wifi_set_promiscuous_rx_cb(SnifferCallback);
-                esp_wifi_set_promiscuous(true);
-                // Don't call esp_wifi_set_channel() - fails when STA connected, already on correct channel
-                // Force radio active - must be AFTER promiscuous enable and external scan mode
-                esp_wifi_set_ps(WIFI_PS_NONE);
+                    esp_wifi_set_channel(primary, second);
+                    esp_wifi_set_promiscuous_rx_cb(SnifferCallback);
+                    esp_wifi_set_promiscuous(true);
 
-                ESP_LOGI(TAG, "WiFi sniffer enabled on channel %d for %d seconds (connected)", primary, duration);
+                    ESP_LOGI(TAG, "WiFi sniffer (disconnected) enabled on channel %d for %d seconds", primary, duration);
+                    xTaskCreatePinnedToCore(SnifferTask, "sniffer", 4096, (void*)(uintptr_t)duration, 18, &sniffer_task_handle_, 1);
 
-                xTaskCreatePinnedToCore(SnifferTask, "sniffer", 4096, (void*)(uintptr_t)duration, 18, &sniffer_task_handle_, 1);
+                    return std::string("{\"success\":true,\"message\":\"Sniffer started (disconnected mode) for " + std::to_string(duration) + " seconds on channel " + std::to_string(primary) + ". Capturing ALL traffic including DNS.\",\"duration\":" + std::to_string(duration) + ",\"mode\":\"disconnected\"}");
+                } else {
+                    // Connected mode: captures management frames + some data
+                    sniffer_disconnected_ = false;
+                    wifi_mgr.SetExternalScanMode(true);
+                    esp_wifi_set_promiscuous_rx_cb(SnifferCallback);
+                    esp_wifi_set_promiscuous(true);
+                    esp_wifi_set_ps(WIFI_PS_NONE);
 
-                return std::string("{\"success\":true,\"message\":\"Sniffer started for " + std::to_string(duration) + " seconds on channel " + std::to_string(primary) + ". Capturing WiFi management frames.\",\"duration\":" + std::to_string(duration) + "}");
+                    ESP_LOGI(TAG, "WiFi sniffer (connected) enabled on channel %d for %d seconds", primary, duration);
+                    xTaskCreatePinnedToCore(SnifferTask, "sniffer", 4096, (void*)(uintptr_t)duration, 18, &sniffer_task_handle_, 1);
+
+                    return std::string("{\"success\":true,\"message\":\"Sniffer started for " + std::to_string(duration) + " seconds on channel " + std::to_string(primary) + ". Capturing WiFi management frames.\",\"duration\":" + std::to_string(duration) + ",\"mode\":\"connected\"}");
+                }
             });
 
         mcp_server.AddTool("self.wifi.get_sniffer_log",
@@ -1008,6 +1039,29 @@ public:
                 int count = sniffer_log_.size();
                 ClearSnifferLogFromNvs();
                 return std::string("{\"success\":true,\"message\":\"Cleared " + std::to_string(count) + " sniffer log entries.\"}");
+            });
+
+        mcp_server.AddTool("self.wifi.get_dns_log",
+            "Get DNS query log captured by LwIP hook.\n"
+            "Returns list of DNS queries made by this device (hostname + timestamp).\n"
+            "Use this to see what hostnames the device is resolving.",
+            PropertyList(), [](const PropertyList& properties) -> ReturnValue {
+                cJSON* root = cJSON_CreateObject();
+                cJSON* queries = cJSON_CreateArray();
+                uint32_t now = esp_timer_get_time() / 1000000;
+                for (const auto& q : dns_log_) {
+                    cJSON* item = cJSON_CreateObject();
+                    cJSON_AddStringToObject(item, "hostname", q.hostname.c_str());
+                    cJSON_AddNumberToObject(item, "seconds_ago", now - q.timestamp_sec);
+                    cJSON_AddItemToArray(queries, item);
+                }
+                cJSON_AddItemToObject(root, "dns_queries", queries);
+                cJSON_AddNumberToObject(root, "total", dns_log_.size());
+                char* json = cJSON_PrintUnformatted(root);
+                std::string result(json);
+                cJSON_free(json);
+                cJSON_Delete(root);
+                return result;
             });
 
         mcp_server.AddTool("self.get_memory_info",
@@ -1149,14 +1203,34 @@ public:
         if (level != PowerSaveLevel::LOW_POWER) {
             power_save_timer_->WakeUp();
         }
+        // Block LOW_POWER during sniffer to keep radio active for promiscuous mode
+        if (sniffer_active_ && level == PowerSaveLevel::LOW_POWER) {
+            return;
+        }
         WifiBoard::SetPowerSaveLevel(level);
     }
 };
 
 bool MyBoard::sniffer_active_ = false;
+bool MyBoard::sniffer_disconnected_ = false;
 TaskHandle_t MyBoard::sniffer_task_handle_ = nullptr;
 QueueHandle_t MyBoard::sniffer_queue_ = nullptr;
 std::vector<MyBoard::SnifferPacket> MyBoard::sniffer_log_;
 int MyBoard::sniffer_duration_seconds_ = 10;
+std::vector<MyBoard::DnsQuery> MyBoard::dns_log_;
+
+extern "C" int lwip_hook_dns_external_resolve(const char* name, ip_addr_t* addr,
+                                               dns_found_callback found, void* callback_arg,
+                                               u8_t addrtype, err_t* err) {
+    if (name && strlen(name) > 0) {
+        uint32_t now = esp_timer_get_time() / 1000000;
+        MyBoard::dns_log_.push_back({now, std::string(name)});
+        if (MyBoard::dns_log_.size() > MyBoard::MAX_DNS_LOG) {
+            MyBoard::dns_log_.erase(MyBoard::dns_log_.begin());
+        }
+        ESP_LOGI("DNS_HOOK", "Query: %s", name);
+    }
+    return 0;  // 0 = don't consume, let normal DNS resolution continue
+}
 
 DECLARE_BOARD(MyBoard);
