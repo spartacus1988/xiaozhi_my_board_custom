@@ -17,6 +17,7 @@
 #include <ssid_manager.h>
 #include <esp_lcd_panel_vendor.h>
 #include <nvs_flash.h>
+#include <esp_heap_caps.h>
 
 #include <driver/rtc_io.h>
 #include <esp_sleep.h>
@@ -915,6 +916,96 @@ public:
                 int count = sniffer_log_.size();
                 ClearSnifferLogFromNvs();
                 return std::string("{\"success\":true,\"message\":\"Cleared " + std::to_string(count) + " sniffer log entries.\"}");
+            });
+
+        mcp_server.AddTool("self.get_memory_info",
+            "Get detailed memory usage information by memory type.\n"
+            "Returns: Internal RAM, PSRAM, DMA, and task stack usage.\n"
+            "Use this to check how much memory is available on the device.",
+            PropertyList(), [](const PropertyList& properties) -> ReturnValue {
+                cJSON* root = cJSON_CreateObject();
+
+                // Internal DRAM (heap_caps_get_free_size with MALLOC_CAP_8BIT)
+                size_t dram_total = heap_caps_get_total_size(MALLOC_CAP_8BIT);
+                size_t dram_free = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+                size_t dram_min = heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT);
+                cJSON* dram = cJSON_CreateObject();
+                cJSON_AddNumberToObject(dram, "total", dram_total);
+                cJSON_AddNumberToObject(dram, "free", dram_free);
+                cJSON_AddNumberToObject(dram, "min_free", dram_min);
+                cJSON_AddNumberToObject(dram, "used", dram_total - dram_free);
+                cJSON_AddNumberToObject(dram, "usage_pct", dram_total > 0 ? (int)((dram_total - dram_free) * 100 / dram_total) : 0);
+                cJSON_AddItemToObject(root, "internal_dram", dram);
+
+                // Internal IRAM
+                size_t iram_total = heap_caps_get_total_size(MALLOC_CAP_32BIT);
+                size_t iram_free = heap_caps_get_free_size(MALLOC_CAP_32BIT);
+                size_t iram_min = heap_caps_get_minimum_free_size(MALLOC_CAP_32BIT);
+                cJSON* iram = cJSON_CreateObject();
+                cJSON_AddNumberToObject(iram, "total", iram_total);
+                cJSON_AddNumberToObject(iram, "free", iram_free);
+                cJSON_AddNumberToObject(iram, "min_free", iram_min);
+                cJSON_AddNumberToObject(iram, "used", iram_total - iram_free);
+                cJSON_AddNumberToObject(iram, "usage_pct", iram_total > 0 ? (int)((iram_total - iram_free) * 100 / iram_total) : 0);
+                cJSON_AddItemToObject(root, "internal_iram", iram);
+
+                // PSRAM
+                size_t psram_total = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
+                size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+                size_t psram_min = heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM);
+                cJSON* psram = cJSON_CreateObject();
+                cJSON_AddNumberToObject(psram, "total", psram_total);
+                cJSON_AddNumberToObject(psram, "free", psram_free);
+                cJSON_AddNumberToObject(psram, "min_free", psram_min);
+                cJSON_AddNumberToObject(psram, "used", psram_total - psram_free);
+                cJSON_AddNumberToObject(psram, "usage_pct", psram_total > 0 ? (int)((psram_total - psram_free) * 100 / psram_total) : 0);
+                cJSON_AddItemToObject(root, "psram", psram);
+
+                // DMA-capable memory
+                size_t dma_total = heap_caps_get_total_size(MALLOC_CAP_DMA);
+                size_t dma_free = heap_caps_get_free_size(MALLOC_CAP_DMA);
+                size_t dma_min = heap_caps_get_minimum_free_size(MALLOC_CAP_DMA);
+                cJSON* dma = cJSON_CreateObject();
+                cJSON_AddNumberToObject(dma, "total", dma_total);
+                cJSON_AddNumberToObject(dma, "free", dma_free);
+                cJSON_AddNumberToObject(dma, "min_free", dma_min);
+                cJSON_AddNumberToObject(dma, "used", dma_total - dma_free);
+                cJSON_AddNumberToObject(dma, "usage_pct", dma_total > 0 ? (int)((dma_total - dma_free) * 100 / dma_total) : 0);
+                cJSON_AddItemToObject(root, "dma", dma);
+
+                // Overall heap summary
+                cJSON* summary = cJSON_CreateObject();
+                cJSON_AddNumberToObject(summary, "total_heap", heap_caps_get_total_size(MALLOC_CAP_DEFAULT));
+                cJSON_AddNumberToObject(summary, "free_heap", esp_get_free_heap_size());
+                cJSON_AddNumberToObject(summary, "min_free_heap", esp_get_minimum_free_heap_size());
+                cJSON_AddItemToObject(root, "heap_summary", summary);
+
+                // Top task stacks
+                cJSON* tasks = cJSON_CreateArray();
+                UBaseType_t task_count = uxTaskGetNumberOfTasks();
+                TaskStatus_t* task_status = (TaskStatus_t*)pvPortMalloc(task_count * sizeof(TaskStatus_t));
+                if (task_status) {
+                    uint32_t total_runtime;
+                    task_count = uxTaskGetSystemState(task_status, task_count, &total_runtime);
+                    for (UBaseType_t i = 0; i < task_count; i++) {
+                        cJSON* t = cJSON_CreateObject();
+                        cJSON_AddStringToObject(t, "name", task_status[i].pcTaskName);
+                        cJSON_AddNumberToObject(t, "stack_high", task_status[i].usStackHighWaterMark * 4);
+                        cJSON_AddNumberToObject(t, "stack_min_pct", task_status[i].usStackHighWaterMark > 0 ?
+                            (int)((1 - (float)task_status[i].usStackHighWaterMark * 4 / (float)configMINIMAL_STACK_SIZE / 4) * 100) : 0);
+                        cJSON_AddNumberToObject(t, "priority", task_status[i].uxCurrentPriority);
+                        cJSON_AddNumberToObject(t, "runtime_pct", task_status[i].ulRunTimeCounter * 100 / total_runtime);
+                        cJSON_AddItemToArray(tasks, t);
+                    }
+                    vPortFree(task_status);
+                }
+                cJSON_AddItemToObject(root, "tasks", tasks);
+
+                char* json_str = cJSON_PrintUnformatted(root);
+                std::string result(json_str);
+                cJSON_free(json_str);
+                cJSON_Delete(root);
+                return result;
             });
     }
 
