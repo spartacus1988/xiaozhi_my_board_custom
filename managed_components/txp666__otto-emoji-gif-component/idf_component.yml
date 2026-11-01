@@ -1,0 +1,11 @@
+dependencies:
+  lvgl/lvgl: '>=9.0'
+description: Otto robot GIF emoji resource pack - 21 Xiaozhi-standard animated GIF
+  emojis
+license: MIT
+repository: git://github.com/txp666/otto-emoji-gif-component.git
+repository_info:
+  commit_sha: 970cf66906d7c30059faa2704e7002f06b8c3619
+  path: .
+url: https://github.com/txp666/otto-emoji-gif-component
+version: 1.3.0
