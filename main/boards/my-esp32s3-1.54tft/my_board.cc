@@ -13,6 +13,7 @@
 
 #include <esp_log.h>
 #include <esp_wifi.h>
+#include <esp_netif.h>
 #include <wifi_manager.h>
 #include <ssid_manager.h>
 #include <esp_lcd_panel_vendor.h>
@@ -24,7 +25,10 @@
 
 #include <driver/rtc_io.h>
 #include <esp_sleep.h>
+#include <atomic>
+#include <cstring>
 #include <map>
+#include <mutex>
 
 #define TAG "MyBoard"
 #define NVS_SNIFFER_NAMESPACE "sniffer"
@@ -58,6 +62,34 @@ private:
     static QueueHandle_t sniffer_queue_;
     static std::vector<SnifferPacket> sniffer_log_;
     static int sniffer_duration_seconds_;
+
+    // Answer of the ESP8266 light board for the command that is being executed.
+    // It is stored in RAM and in NVS right after the request so that the result
+    // survives the Wi-Fi network switch and even a reboot.
+    struct LightReport {
+        bool valid = false;           // true once at least one command was executed
+        std::string command;          // turn_on / turn_off / status / restore_a0 / reboot
+        bool success = false;         // ESP8266 answered the HTTP request
+        std::string error;            // human readable failure reason
+        std::string response;         // raw answer body of the ESP8266
+        std::string relay;            // "on" / "off"
+        std::string mode;             // "auto" (A0 control) / "manual"
+        int adc = -1;                 // current A0 (ADC) value, 0..1023
+        int threshold = -1;           // A0 threshold used by the auto mode
+        std::string home_ssid;        // network of the xiaozhi before the switch
+        bool wifi_restored = false;   // xiaozhi reconnected to that network
+        uint32_t uptime_sec = 0;      // seconds since boot when the answer arrived
+    };
+
+    struct LightCommandTaskParam {
+        MyBoard* self;
+        int reply_id;
+        std::string action;
+    };
+
+    static std::atomic<bool> light_command_running_;
+    static std::mutex light_report_mutex_;
+    static LightReport last_light_report_;
 
 public:
     struct DnsQuery {
@@ -281,6 +313,9 @@ public:
 
         // Load persisted sniffer log from NVS
         LoadSnifferLogFromNvs();
+
+        // Load the remembered answer of the last light command from NVS
+        LoadLightReportFromNvs();
     }
 
     static void WifiScanTask(void* param) {
@@ -794,6 +829,538 @@ public:
         vTaskDelete(nullptr);
     }
 
+    // ====================================================================
+    // ESP8266 light control
+    // Firmware: https://github.com/spartacus1988/esp8266-light/
+    //
+    // The ESP8266 light board does not use a router: it creates its own Wi-Fi
+    // access point (LIGHT_AP_SSID). Every voice command therefore:
+    //   1. leaves the current network and joins LIGHT_AP_SSID,
+    //   2. sends an HTTP request to the ESP8266 web server,
+    //   3. remembers the answer of the ESP8266 (RAM + NVS),
+    //   4. reconnects to the network it was using before,
+    //   5. reports the remembered answer to the LLM once the connection to the
+    //      server is restored (deferred MCP reply of the original tool call).
+    // ====================================================================
+
+    static std::string LightPassword() {
+        // A saved network with the same name wins (custom password)
+        for (const auto& item : SsidManager::GetInstance().GetSsidList()) {
+            if (item.ssid == LIGHT_AP_SSID && !item.password.empty()) {
+                return item.password;
+            }
+        }
+        return LIGHT_AP_PASSWORD;
+    }
+
+    static bool StaIpInLightSubnet(std::string& ip_out) {
+        auto* netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+        if (netif == nullptr) {
+            return false;
+        }
+        esp_netif_ip_info_t ip_info;
+        if (esp_netif_get_ip_info(netif, &ip_info) != ESP_OK || ip_info.ip.addr == 0) {
+            return false;
+        }
+        char ip[16] = {};
+        esp_ip4addr_ntoa(&ip_info.ip, ip, sizeof(ip));
+        ip_out = ip;
+        return strncmp(ip, LIGHT_AP_IP_PREFIX, strlen(LIGHT_AP_IP_PREFIX)) == 0;
+    }
+
+    static bool ApplyStaticIp() {
+        auto* netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+        if (netif == nullptr) {
+            return false;
+        }
+        // Fallback for an ESP8266 AP that does not run a DHCP server
+        esp_netif_dhcpc_stop(netif);
+        esp_netif_ip_info_t ip_info = {};
+        ip_info.ip.addr = esp_ip4addr_aton(LIGHT_STATIC_FALLBACK_IP);
+        ip_info.gw.addr = esp_ip4addr_aton(LIGHT_DEVICE_HOST);
+        ip_info.netmask.addr = esp_ip4addr_aton("255.255.255.0");
+        esp_err_t err = esp_netif_set_ip_info(netif, &ip_info);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "[LIGHT] cannot set static IP: %s", esp_err_to_name(err));
+            return false;
+        }
+        return true;
+    }
+
+    static bool JoinLightAp(std::string& error) {
+        auto& wifi_mgr = WifiManager::GetInstance();
+
+        // Take the radio away from WifiStation so it neither scans nor reconnects
+        wifi_mgr.SetExternalScanMode(true);
+        esp_wifi_set_ps(WIFI_PS_NONE);
+
+        esp_wifi_disconnect();
+        for (int i = 0; i < 30 && wifi_mgr.IsConnected(); i++) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+
+        std::string password = LightPassword();
+        wifi_config_t config = {};
+        strncpy(reinterpret_cast<char*>(config.sta.ssid), LIGHT_AP_SSID, sizeof(config.sta.ssid) - 1);
+        strncpy(reinterpret_cast<char*>(config.sta.password), password.c_str(), sizeof(config.sta.password) - 1);
+        config.sta.scan_method = WIFI_FAST_SCAN;
+        config.sta.threshold.authmode = WIFI_AUTH_OPEN;
+        esp_err_t err = esp_wifi_set_config(WIFI_IF_STA, &config);
+        if (err != ESP_OK) {
+            error = std::string("Cannot configure WiFi: ") + esp_err_to_name(err);
+            return false;
+        }
+
+        ESP_LOGI(TAG, "[LIGHT] joining %s", LIGHT_AP_SSID);
+        err = esp_wifi_connect();
+        if (err != ESP_OK) {
+            error = std::string("Cannot start WiFi connection: ") + esp_err_to_name(err);
+            return false;
+        }
+
+        std::string ip;
+        bool static_ip_applied = false;
+        for (int waited = 0; waited < LIGHT_JOIN_TIMEOUT_MS; waited += 200) {
+            if (StaIpInLightSubnet(ip)) {
+                ESP_LOGI(TAG, "[LIGHT] joined %s with IP %s", LIGHT_AP_SSID, ip.c_str());
+                return true;
+            }
+            if (!static_ip_applied && waited >= LIGHT_DHCP_TIMEOUT_MS) {
+                static_ip_applied = true;
+                ESP_LOGW(TAG, "[LIGHT] no DHCP lease from %s, trying static IP %s",
+                         LIGHT_AP_SSID, LIGHT_STATIC_FALLBACK_IP);
+                ApplyStaticIp();
+            }
+            vTaskDelay(pdMS_TO_TICKS(200));
+        }
+
+        error = std::string("Cannot join WiFi network ") + LIGHT_AP_SSID +
+                " (is the esp8266 light board powered on?)";
+        return false;
+    }
+
+    static bool RestoreHomeNetwork(const std::string& original_ssid, std::string& error) {
+        auto& wifi_mgr = WifiManager::GetInstance();
+
+        // Give the radio back to WifiStation: it rescans the saved networks
+        wifi_mgr.SetExternalScanMode(false);
+        esp_wifi_set_ps(WIFI_PS_MAX_MODEM);
+        wifi_mgr.Reconnect();
+
+        for (int waited = 0; waited < LIGHT_RESTORE_TIMEOUT_MS; waited += 500) {
+            if (wifi_mgr.IsConnected()) {
+                std::string ssid = wifi_mgr.GetSsid();
+                if (original_ssid.empty() || ssid == original_ssid || waited >= 8000) {
+                    ESP_LOGI(TAG, "[LIGHT] back on '%s' (%s)", ssid.c_str(), wifi_mgr.GetIpAddress().c_str());
+                    return true;
+                }
+            }
+            vTaskDelay(pdMS_TO_TICKS(500));
+        }
+
+        if (wifi_mgr.IsConnected()) {
+            ESP_LOGW(TAG, "[LIGHT] connected to '%s' instead of '%s'",
+                     wifi_mgr.GetSsid().c_str(), original_ssid.c_str());
+            return true;
+        }
+
+        error = "Cannot reconnect to the original network '" + original_ssid + "'";
+        return false;
+    }
+
+    static void SendLightCommand(const std::string& action, LightReport& report) {
+        std::string url = std::string("http://") + LIGHT_DEVICE_HOST;
+        if (action == "turn_on") {
+            url += "/api?relay=on";
+        } else if (action == "turn_off") {
+            url += "/api?relay=off";
+        } else if (action == "status") {
+            url += "/api";
+        } else if (action == "restore_a0") {
+            url += "/api?mode=auto";
+        } else if (action == "reboot") {
+            url += "/?reset=1";   // the board answers with a redirect and resets itself
+        } else {
+            report.error = "Unknown light action: " + action;
+            return;
+        }
+
+        ESP_LOGI(TAG, "[LIGHT] GET %s", url.c_str());
+        auto http = Board::GetInstance().GetNetwork()->CreateHttp(0);
+        http->SetTimeout(5000);
+        if (!http->Open("GET", url)) {
+            report.error = "No HTTP answer from the esp8266 light board";
+            http->Close();
+            return;
+        }
+
+        int status = http->GetStatusCode();
+        std::string body = http->ReadAll();
+        http->Close();
+
+        if (action == "reboot") {
+            if (status == 200 || status == 302 || status == 303) {
+                report.success = true;
+                report.response = "reset requested (HTTP " + std::to_string(status) + ")";
+            } else {
+                report.error = "Unexpected HTTP status " + std::to_string(status) + " on reboot request";
+            }
+            return;
+        }
+
+        if (status != 200) {
+            report.error = "Unexpected HTTP status " + std::to_string(status);
+            report.response = body;
+            return;
+        }
+
+        // {"relay":"on","mode":"manual","adc":512,"threshold":512,"ip":"192.168.4.1"}
+        cJSON* root = cJSON_Parse(body.c_str());
+        if (root == nullptr) {
+            report.error = "Cannot parse the answer of the esp8266";
+            report.response = body;
+            return;
+        }
+        cJSON* relay = cJSON_GetObjectItem(root, "relay");
+        cJSON* mode = cJSON_GetObjectItem(root, "mode");
+        cJSON* adc = cJSON_GetObjectItem(root, "adc");
+        cJSON* threshold = cJSON_GetObjectItem(root, "threshold");
+        if (cJSON_IsString(relay)) report.relay = relay->valuestring;
+        if (cJSON_IsString(mode)) report.mode = mode->valuestring;
+        if (cJSON_IsNumber(adc)) report.adc = adc->valueint;
+        if (cJSON_IsNumber(threshold)) report.threshold = threshold->valueint;
+        cJSON_Delete(root);
+
+        report.response = body;
+        if (report.relay.empty()) {
+            report.error = "The esp8266 answer does not contain the relay state";
+            return;
+        }
+        report.success = true;
+    }
+
+    static std::string LightReportToJson(const LightReport& report) {
+        cJSON* root = cJSON_CreateObject();
+        cJSON_AddStringToObject(root, "command", report.command.c_str());
+        cJSON_AddBoolToObject(root, "success", report.success);
+        if (!report.error.empty()) cJSON_AddStringToObject(root, "error", report.error.c_str());
+        if (!report.response.empty()) cJSON_AddStringToObject(root, "esp8266_response", report.response.c_str());
+        if (!report.relay.empty()) cJSON_AddStringToObject(root, "relay", report.relay.c_str());
+        if (!report.mode.empty()) cJSON_AddStringToObject(root, "mode", report.mode.c_str());
+        if (report.adc >= 0) cJSON_AddNumberToObject(root, "a0_adc", report.adc);
+        if (report.threshold >= 0) cJSON_AddNumberToObject(root, "a0_threshold", report.threshold);
+        cJSON_AddStringToObject(root, "wifi_ssid", report.home_ssid.c_str());
+        cJSON_AddBoolToObject(root, "wifi_restored", report.wifi_restored);
+        cJSON_AddNumberToObject(root, "seconds_since_boot", report.uptime_sec);
+
+        char* printed = cJSON_PrintUnformatted(root);
+        std::string result(printed);
+        cJSON_free(printed);
+        cJSON_Delete(root);
+        return result;
+    }
+
+    static std::string LightSummary(const LightReport& report) {
+        std::string summary;
+        if (report.success) {
+            summary = "Light command '" + report.command + "' executed on the esp8266 light board.";
+            if (!report.response.empty()) summary += " Board replied: " + report.response + ".";
+            if (!report.relay.empty()) summary += " Relay is " + report.relay + ".";
+            if (!report.mode.empty()) summary += " Control mode: " + report.mode +
+                                                 (report.mode == "auto" ? " (relay follows the A0 input)." : ".");
+            if (report.adc >= 0) summary += " A0 (ADC) reading: " + std::to_string(report.adc) +
+                                            " (threshold " + std::to_string(report.threshold) + ").";
+        } else {
+            summary = "Light command '" + report.command + "' failed: " +
+                      (report.error.empty() ? std::string("unknown error") : report.error) + ".";
+        }
+        if (report.wifi_restored) {
+            summary += " The device reconnected to WiFi '" + report.home_ssid + "'.";
+        } else {
+            summary += " WARNING: the device could not reconnect to WiFi '" + report.home_ssid + "'.";
+        }
+        return summary;
+    }
+
+    static std::string LightMcpResult(const LightReport& report, const std::string& summary) {
+        cJSON* wrapper = cJSON_CreateObject();
+        cJSON* content = cJSON_CreateArray();
+        cJSON* text = cJSON_CreateObject();
+        cJSON_AddStringToObject(text, "type", "text");
+        cJSON_AddStringToObject(text, "text", summary.c_str());
+        cJSON_AddItemToArray(content, text);
+        cJSON_AddItemToObject(wrapper, "content", content);
+        cJSON_AddBoolToObject(wrapper, "isError", !report.success);
+
+        char* printed = cJSON_PrintUnformatted(wrapper);
+        std::string result(printed);
+        cJSON_free(printed);
+        cJSON_Delete(wrapper);
+        return result;
+    }
+
+    static void SaveLightReportToNvs(const LightReport& report) {
+        nvs_handle_t handle;
+        if (nvs_open("light", NVS_READWRITE, &handle) != ESP_OK) {
+            ESP_LOGE(TAG, "[LIGHT] cannot store the answer in NVS");
+            return;
+        }
+        nvs_set_u8(handle, "valid", 1);
+        nvs_set_str(handle, "command", report.command.c_str());
+        nvs_set_u8(handle, "ok", report.success ? 1 : 0);
+        nvs_set_str(handle, "error", report.error.c_str());
+        nvs_set_str(handle, "response", report.response.c_str());
+        nvs_set_str(handle, "relay", report.relay.c_str());
+        nvs_set_str(handle, "mode", report.mode.c_str());
+        nvs_set_i32(handle, "adc", report.adc);
+        nvs_set_i32(handle, "threshold", report.threshold);
+        nvs_set_str(handle, "ssid", report.home_ssid.c_str());
+        nvs_set_u8(handle, "restored", report.wifi_restored ? 1 : 0);
+        nvs_set_u32(handle, "uptime", report.uptime_sec);
+        nvs_commit(handle);
+        nvs_close(handle);
+        ESP_LOGI(TAG, "[LIGHT] answer stored in NVS");
+    }
+
+    static void LoadLightReportFromNvs() {
+        nvs_handle_t handle;
+        if (nvs_open("light", NVS_READONLY, &handle) != ESP_OK) {
+            return;
+        }
+        uint8_t valid = 0;
+        if (nvs_get_u8(handle, "valid", &valid) != ESP_OK || valid == 0) {
+            nvs_close(handle);
+            return;
+        }
+
+        LightReport report;
+        report.valid = true;
+        char buf[768];
+        size_t len;
+
+        len = sizeof(buf); if (nvs_get_str(handle, "command", buf, &len) == ESP_OK) report.command = buf;
+        uint8_t ok = 0; nvs_get_u8(handle, "ok", &ok); report.success = ok != 0;
+        len = sizeof(buf); if (nvs_get_str(handle, "error", buf, &len) == ESP_OK) report.error = buf;
+        len = sizeof(buf); if (nvs_get_str(handle, "response", buf, &len) == ESP_OK) report.response = buf;
+        len = sizeof(buf); if (nvs_get_str(handle, "relay", buf, &len) == ESP_OK) report.relay = buf;
+        len = sizeof(buf); if (nvs_get_str(handle, "mode", buf, &len) == ESP_OK) report.mode = buf;
+        int32_t adc = -1, threshold = -1;
+        nvs_get_i32(handle, "adc", &adc);
+        nvs_get_i32(handle, "threshold", &threshold);
+        report.adc = adc;
+        report.threshold = threshold;
+        len = sizeof(buf); if (nvs_get_str(handle, "ssid", buf, &len) == ESP_OK) report.home_ssid = buf;
+        uint8_t restored = 0; nvs_get_u8(handle, "restored", &restored); report.wifi_restored = restored != 0;
+        nvs_get_u32(handle, "uptime", &report.uptime_sec);
+        nvs_close(handle);
+
+        {
+            std::lock_guard<std::mutex> lock(light_report_mutex_);
+            last_light_report_ = report;
+        }
+        ESP_LOGI(TAG, "[LIGHT] remembered answer restored from NVS: %s", report.command.c_str());
+    }
+
+#if LIGHT_AUTO_REPORT
+    // Bring the audio channel to the LLM back up. The old channel died together
+    // with the previous network, so the conversation is restarted from idle.
+    static bool ReopenAudioChannel() {
+        auto& app = Application::GetInstance();
+
+        auto state = app.GetDeviceState();
+        if (state == kDeviceStateConnecting || state == kDeviceStateListening || state == kDeviceStateSpeaking) {
+            if (!app.SetDeviceState(kDeviceStateIdle)) {
+                ESP_LOGW(TAG, "[LIGHT] cannot leave device state %d", static_cast<int>(state));
+                return false;
+            }
+        }
+
+        for (int waited = 0; waited < LIGHT_REPORT_TIMEOUT_MS; waited += 500) {
+            state = app.GetDeviceState();
+            if (state == kDeviceStateListening || state == kDeviceStateSpeaking) {
+                return true;
+            }
+            if (state == kDeviceStateIdle) {
+                // Opens the audio channel when it is closed (HandleToggleChatEvent)
+                app.ToggleChatState();
+            }
+            vTaskDelay(pdMS_TO_TICKS(500));
+        }
+
+        ESP_LOGW(TAG, "[LIGHT] audio channel did not open within %d ms", LIGHT_REPORT_TIMEOUT_MS);
+        if (app.GetDeviceState() == kDeviceStateConnecting) {
+            app.SetDeviceState(kDeviceStateIdle);   // do not stay in "connecting"
+        }
+        return false;
+    }
+
+    // Do not leave the device in the listening state we opened ourselves
+    static void SettleAfterReport() {
+        auto& app = Application::GetInstance();
+
+        int total = 0;
+        int quiet = 0;
+        while (total < 45000) {
+            auto state = app.GetDeviceState();
+            if (state == kDeviceStateIdle) {
+                return;
+            }
+            if (state == kDeviceStateListening) {
+                quiet += 500;
+                if (quiet >= 6000) {
+                    app.StopListening();
+                    return;
+                }
+            } else {
+                quiet = 0;   // the model is speaking - keep waiting
+            }
+            vTaskDelay(pdMS_TO_TICKS(500));
+            total += 500;
+        }
+
+        // The model took longer than the budget: wait for it to finish anyway
+        for (int i = 0; i < 60 && app.GetDeviceState() == kDeviceStateSpeaking; i++) {
+            vTaskDelay(pdMS_TO_TICKS(500));
+        }
+        if (app.GetDeviceState() == kDeviceStateListening) {
+            app.StopListening();
+        }
+    }
+#endif // LIGHT_AUTO_REPORT
+
+    // Report the remembered answer of the ESP8266 to the LLM
+    static void ReportToLlm(MyBoard* self, int reply_id, const LightReport& report) {
+        std::string summary = LightSummary(report);
+        std::string mcp_result = LightMcpResult(report, summary);
+        ESP_LOGI(TAG, "[LIGHT] %s", summary.c_str());
+
+        if (reply_id >= 0) {
+#if LIGHT_AUTO_REPORT
+            // The connection to the LLM died with the previous network: open the
+            // audio channel again so the remembered answer can reach the model.
+            if (!ReopenAudioChannel()) {
+                ESP_LOGW(TAG, "[LIGHT] LLM channel unavailable, answer kept for self.light.get_last_report");
+            }
+#endif
+            // Deferred MCP reply of the original tool call
+            McpServer::GetInstance().SendReply(reply_id, mcp_result);
+            ESP_LOGI(TAG, "[LIGHT] deferred MCP reply sent for id=%d", reply_id);
+#if LIGHT_AUTO_REPORT
+            // Give the model time to speak the result, then leave the
+            // conversation that was opened only for this report.
+            SettleAfterReport();
+#endif
+        }
+
+        // Show the remembered answer on the device
+        auto display = self->GetDisplay();
+        display->ShowNotification(report.success ? "Light command done" : "Light command failed", 4000);
+        display->SetChatMessage("system", summary.c_str());
+    }
+
+    static void LightCommandTask(void* param) {
+        auto* p = static_cast<LightCommandTaskParam*>(param);
+        MyBoard* self = p->self;
+        int reply_id = p->reply_id;
+        std::string action = std::move(p->action);
+        delete p;
+
+        auto& wifi_mgr = WifiManager::GetInstance();
+        auto display = self->GetDisplay();
+
+        // Remember where we are before switching networks
+        LightReport report;
+        report.valid = true;
+        report.command = action;
+        report.home_ssid = wifi_mgr.GetSsid();
+        report.uptime_sec = static_cast<uint32_t>(esp_timer_get_time() / 1000000LL);
+        ESP_LOGI(TAG, "[LIGHT] command '%s' started, home network '%s'",
+                 action.c_str(), report.home_ssid.c_str());
+
+        display->SetChatMessage("system", "Light: connecting to " LIGHT_AP_SSID "...");
+
+        // 1+2. Join the ESP8266 access point and send the HTTP command
+        std::string error;
+        if (JoinLightAp(error)) {
+            SendLightCommand(action, report);
+        } else {
+            report.success = false;
+            report.error = error;
+        }
+
+        // 3. Remember the answer of the ESP8266 right away (RAM + NVS)
+        report.uptime_sec = static_cast<uint32_t>(esp_timer_get_time() / 1000000LL);
+        {
+            std::lock_guard<std::mutex> lock(light_report_mutex_);
+            last_light_report_ = report;
+        }
+        ESP_LOGI(TAG, "[LIGHT] esp8266 answer: %s",
+                 report.response.empty() ? report.error.c_str() : report.response.c_str());
+
+        // 4. Switch back to the network we were using before
+        display->SetChatMessage("system", "Light: restoring WiFi ...");
+        std::string restore_error;
+        report.wifi_restored = RestoreHomeNetwork(report.home_ssid, restore_error);
+        if (!report.wifi_restored) {
+            report.error = report.error.empty() ? restore_error : report.error + "; " + restore_error;
+            ESP_LOGE(TAG, "[LIGHT] %s", restore_error.c_str());
+        }
+        {
+            std::lock_guard<std::mutex> lock(light_report_mutex_);
+            last_light_report_ = report;
+        }
+        SaveLightReportToNvs(report);
+
+        // 5. Report the remembered answer once the connection is back
+        if (report.wifi_restored) {
+            ReportToLlm(self, reply_id, report);
+        } else {
+            ESP_LOGW(TAG, "[LIGHT] report kept for self.light.get_last_report (id=%d not delivered)", reply_id);
+            display->ShowNotification("Light: WiFi not restored", 5000);
+            display->SetChatMessage("system", LightSummary(report).c_str());
+        }
+
+        light_command_running_ = false;
+        ESP_LOGI(TAG, "[LIGHT] command task finished");
+        vTaskDelete(nullptr);
+    }
+
+    // Starts a light command in the background; the MCP reply is deferred and
+    // sent only after the ESP8266 answered and the network is restored.
+    ReturnValue StartLightCommand(const std::string& action) {
+        auto& wifi_mgr = WifiManager::GetInstance();
+
+        if (!wifi_mgr.IsInitialized()) {
+            return std::string("{\"error\":\"WiFi not initialized\"}");
+        }
+        if (wifi_mgr.IsConfigMode()) {
+            return std::string("{\"error\":\"WiFi is in configuration mode\"}");
+        }
+        if (sniffer_active_) {
+            return std::string("{\"error\":\"The WiFi sniffer is running, cannot switch networks now\"}");
+        }
+
+        bool expected = false;
+        if (!light_command_running_.compare_exchange_strong(expected, true)) {
+            return std::string("{\"error\":\"Another light command is already in progress\"}");
+        }
+
+        int reply_id = McpServer::GetInstance().GetPendingToolCallId();
+        ESP_LOGI(TAG, "[LIGHT] '%s' requested, deferred reply id=%d", action.c_str(), reply_id);
+
+        McpServer::GetInstance().SetDeferredReply(true);
+        auto* param = new LightCommandTaskParam{this, reply_id, action};
+        if (xTaskCreatePinnedToCore(LightCommandTask, "light_cmd", 8192, param, 18, nullptr, 1) != pdPASS) {
+            delete param;
+            light_command_running_ = false;
+            McpServer::GetInstance().SetDeferredReply(false);
+            return std::string("{\"error\":\"Failed to start the light command task\"}");
+        }
+
+        return std::string("Executing the light command on the " LIGHT_AP_SSID " network. "
+                           "The device will report the result after it reconnects.");
+    }
+
     void InitializeTools() {
         auto &mcp_server = McpServer::GetInstance();
         mcp_server.AddTool("self.wifi.scan_networks",
@@ -1064,6 +1631,68 @@ public:
                 return result;
             });
 
+        // ---- ESP8266 light control (every command switches WiFi networks) ----
+        mcp_server.AddTool("self.light.turn_on",
+            "Turn ON the light (relay) of the esp8266 light board.\n"
+            "The device temporarily joins the '" LIGHT_AP_SSID "' network, sends the command, "
+            "remembers the answer of the board, reconnects to the previous network and reports "
+            "the result (relay state + A0/ADC value) back to you.\n"
+            "Use it when the user asks to turn the light on.",
+            PropertyList(), [this](const PropertyList&) -> ReturnValue {
+                return StartLightCommand("turn_on");
+            });
+
+        mcp_server.AddTool("self.light.turn_off",
+            "Turn OFF the light (relay) of the esp8266 light board.\n"
+            "The device temporarily joins the '" LIGHT_AP_SSID "' network, sends the command, "
+            "remembers the answer of the board, reconnects to the previous network and reports "
+            "the result (relay state + A0/ADC value) back to you.\n"
+            "Use it when the user asks to turn the light off.",
+            PropertyList(), [this](const PropertyList&) -> ReturnValue {
+                return StartLightCommand("turn_off");
+            });
+
+        mcp_server.AddTool("self.light.get_status",
+            "Query the esp8266 light board and return its current state.\n"
+            "Returns: relay state (on/off), control mode (auto = the relay follows the A0 input), "
+            "the current A0 (ADC) value and the auto threshold.\n"
+            "The device switches to the '" LIGHT_AP_SSID "' network and back, so the answer is "
+            "reported a bit later than usual.",
+            PropertyList(), [this](const PropertyList&) -> ReturnValue {
+                return StartLightCommand("status");
+            });
+
+        mcp_server.AddTool("self.light.restore_a0_control",
+            "Give control of the light relay back to the A0 analog input of the esp8266 board "
+            "(auto mode: A0 above the threshold keeps the light on, otherwise off).\n"
+            "Returns: the new control mode and the current A0 (ADC) value.\n"
+            "Use it when the user wants the automatic A0 control back after using voice commands.",
+            PropertyList(), [this](const PropertyList&) -> ReturnValue {
+                return StartLightCommand("restore_a0");
+            });
+
+        mcp_server.AddTool("self.light.reboot",
+            "Reboot the esp8266 light board (it restarts in a few seconds, the Wi-Fi network "
+            LIGHT_AP_SSID " disappears and comes back).\n"
+            "Only use it when the user explicitly asks to reboot the light board.",
+            PropertyList(), [this](const PropertyList&) -> ReturnValue {
+                return StartLightCommand("reboot");
+            });
+
+        mcp_server.AddTool("self.light.get_last_report",
+            "Get the remembered answer of the LAST light command without switching networks.\n"
+            "Returns: command, success flag, raw answer of the esp8266, relay state, control "
+            "mode, A0/ADC value, threshold and the WiFi network of the device.\n"
+            "Use it when the result of a previous light command was not delivered yet or to "
+            "check the light state without waiting for a network switch.",
+            PropertyList(), [](const PropertyList&) -> ReturnValue {
+                std::lock_guard<std::mutex> lock(light_report_mutex_);
+                if (!last_light_report_.valid) {
+                    return std::string("{\"report\":null,\"message\":\"No light command has been executed yet\"}");
+                }
+                return LightReportToJson(last_light_report_);
+            });
+
         mcp_server.AddTool("self.get_memory_info",
             "Get detailed memory usage information by memory type.\n"
             "Returns: Internal RAM, PSRAM, DMA, and task stack usage.\n"
@@ -1218,6 +1847,9 @@ QueueHandle_t MyBoard::sniffer_queue_ = nullptr;
 std::vector<MyBoard::SnifferPacket> MyBoard::sniffer_log_;
 int MyBoard::sniffer_duration_seconds_ = 10;
 std::vector<MyBoard::DnsQuery> MyBoard::dns_log_;
+std::atomic<bool> MyBoard::light_command_running_{false};
+std::mutex MyBoard::light_report_mutex_;
+MyBoard::LightReport MyBoard::last_light_report_;
 
 extern "C" int lwip_hook_dns_external_resolve(const char* name, ip_addr_t* addr,
                                                dns_found_callback found, void* callback_arg,
