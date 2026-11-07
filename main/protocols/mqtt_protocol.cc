@@ -199,7 +199,10 @@ void MqttProtocol::CloseAudioChannel(bool send_goodbye) {
 
     // Only send goodbye when client initiates the close
     // Don't send if server already sent goodbye (to avoid ping-pong)
-    if (send_goodbye) {
+    // Also skip it when the connection is already gone: publishing into a dead
+    // socket would raise a spurious SERVER_ERROR alert (e.g. right after an
+    // intentional Wi-Fi network switch performed by a tool).
+    if (send_goodbye && mqtt_ != nullptr && mqtt_->IsConnected()) {
         std::string message = "{";
         message += "\"session_id\":\"" + session_id_ + "\",";
         message += "\"type\":\"goodbye\"";

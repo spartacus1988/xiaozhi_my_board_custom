@@ -39,12 +39,14 @@
 //
 // The ESP8266 creates its own Wi-Fi access point, so every light command makes
 // this board:
+//   0. answer the model immediately (the Wi-Fi switch below kills the MQTT
+//      session of the tool call, a deferred reply would be lost),
 //   1. leave the current network and join LIGHT_AP_SSID,
 //   2. send an HTTP request to the ESP8266 web server (LIGHT_DEVICE_HOST),
 //   3. remember the answer of the board (RAM + NVS),
 //   4. reconnect to the network it was using before,
-//   5. report the remembered answer to the LLM once the connection to the
-//      server is restored (deferred MCP reply, see LIGHT_AUTO_REPORT).
+//   5. show the remembered answer on the display and keep it in NVS
+//      (available later through self.light.get_last_report).
 //
 // HTTP API of the esp8266-light firmware:
 //   GET /api              -> {"relay":"on","mode":"auto","adc":512,"threshold":512,"ip":"..."}
@@ -62,7 +64,5 @@
 #define LIGHT_STATIC_TIMEOUT_MS    3000             // wait after applying the static address
 #define LIGHT_JOIN_TIMEOUT_MS      15000            // overall budget for joining LIGHT_AP_SSID
 #define LIGHT_RESTORE_TIMEOUT_MS   20000            // wait for the original network to come back
-#define LIGHT_REPORT_TIMEOUT_MS    15000            // wait for the LLM audio channel to open again
-#define LIGHT_AUTO_REPORT          1                // 1 = reopen the audio channel and report the result to the LLM
 
 #endif // _BOARD_CONFIG_H_

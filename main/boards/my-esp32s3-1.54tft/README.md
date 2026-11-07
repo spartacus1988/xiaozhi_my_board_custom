@@ -22,6 +22,11 @@ Typical voice requests: «включи свет», «выключи свет», 
 
 ## What happens on a command
 
+The tool replies to the model **immediately** ("the command is running"), so the
+user gets feedback right away. A deferred reply cannot survive the network
+switch: leaving for `esp-light` kills the MQTT session of the tool call, and the
+answer would come back under a new `session_id` that the server cannot match.
+
 The ESP8266 creates its own access point, therefore every command makes the
 xiaozhi board:
 
@@ -30,13 +35,11 @@ xiaozhi board:
 2. send the HTTP request to `http://192.168.4.1`;
 3. **remember the answer of the ESP8266** (RAM + NVS namespace `light`);
 4. reconnect to the network it was using before;
-5. after the connection to the LLM server is restored, reopen the audio channel
-   and report the remembered answer as the (deferred) MCP reply of the tool call,
-   so the model can tell the user the result — relay state, control mode and the
-   A0 value.
+5. show the remembered answer on the display (notification + chat text) and keep
+   it in NVS, so it survives a reboot.
 
-If the LLM channel cannot be opened, the answer is still available through
-`self.light.get_last_report` and is shown on the display.
+The answer stays available to the model through `self.light.get_last_report`
+("what was the result of the last light command"), without switching networks.
 
 ## Configuration
 
@@ -48,7 +51,6 @@ See the `LIGHT_*` block in [`config.h`](./config.h):
 | `LIGHT_AP_PASSWORD` | `light1234` | Password of that network (a saved network with the same name overrides it) |
 | `LIGHT_DEVICE_HOST` | `192.168.4.1` | Web server of the ESP8266 |
 | `LIGHT_STATIC_FALLBACK_IP` | `192.168.4.10` | Static address used if the AP hands out no DHCP lease |
-| `LIGHT_AUTO_REPORT` | `1` | `0` = do not reopen the LLM channel, only store the answer |
 
 ## Building
 

@@ -83,7 +83,6 @@ private:
 
     struct LightCommandTaskParam {
         MyBoard* self;
-        int reply_id;
         std::string action;
     };
 
@@ -835,12 +834,14 @@ public:
     //
     // The ESP8266 light board does not use a router: it creates its own Wi-Fi
     // access point (LIGHT_AP_SSID). Every voice command therefore:
+    //   0. answers the model immediately ("the command is running"), because
+    //      the network switch below kills the MQTT session of this tool call,
     //   1. leaves the current network and joins LIGHT_AP_SSID,
     //   2. sends an HTTP request to the ESP8266 web server,
     //   3. remembers the answer of the ESP8266 (RAM + NVS),
     //   4. reconnects to the network it was using before,
-    //   5. reports the remembered answer to the LLM once the connection to the
-    //      server is restored (deferred MCP reply of the original tool call).
+    //   5. shows the remembered answer on the display and keeps it in NVS,
+    //      so it stays available for self.light.get_last_report.
     // ====================================================================
 
     static std::string LightPassword() {
@@ -1082,23 +1083,6 @@ public:
         return summary;
     }
 
-    static std::string LightMcpResult(const LightReport& report, const std::string& summary) {
-        cJSON* wrapper = cJSON_CreateObject();
-        cJSON* content = cJSON_CreateArray();
-        cJSON* text = cJSON_CreateObject();
-        cJSON_AddStringToObject(text, "type", "text");
-        cJSON_AddStringToObject(text, "text", summary.c_str());
-        cJSON_AddItemToArray(content, text);
-        cJSON_AddItemToObject(wrapper, "content", content);
-        cJSON_AddBoolToObject(wrapper, "isError", !report.success);
-
-        char* printed = cJSON_PrintUnformatted(wrapper);
-        std::string result(printed);
-        cJSON_free(printed);
-        cJSON_Delete(wrapper);
-        return result;
-    }
-
     static void SaveLightReportToNvs(const LightReport& report) {
         nvs_handle_t handle;
         if (nvs_open("light", NVS_READWRITE, &handle) != ESP_OK) {
@@ -1161,96 +1145,14 @@ public:
         ESP_LOGI(TAG, "[LIGHT] remembered answer restored from NVS: %s", report.command.c_str());
     }
 
-#if LIGHT_AUTO_REPORT
-    // Bring the audio channel to the LLM back up. The old channel died together
-    // with the previous network, so the conversation is restarted from idle.
-    static bool ReopenAudioChannel() {
-        auto& app = Application::GetInstance();
-
-        auto state = app.GetDeviceState();
-        if (state == kDeviceStateConnecting || state == kDeviceStateListening || state == kDeviceStateSpeaking) {
-            if (!app.SetDeviceState(kDeviceStateIdle)) {
-                ESP_LOGW(TAG, "[LIGHT] cannot leave device state %d", static_cast<int>(state));
-                return false;
-            }
-        }
-
-        for (int waited = 0; waited < LIGHT_REPORT_TIMEOUT_MS; waited += 500) {
-            state = app.GetDeviceState();
-            if (state == kDeviceStateListening || state == kDeviceStateSpeaking) {
-                return true;
-            }
-            if (state == kDeviceStateIdle) {
-                // Opens the audio channel when it is closed (HandleToggleChatEvent)
-                app.ToggleChatState();
-            }
-            vTaskDelay(pdMS_TO_TICKS(500));
-        }
-
-        ESP_LOGW(TAG, "[LIGHT] audio channel did not open within %d ms", LIGHT_REPORT_TIMEOUT_MS);
-        if (app.GetDeviceState() == kDeviceStateConnecting) {
-            app.SetDeviceState(kDeviceStateIdle);   // do not stay in "connecting"
-        }
-        return false;
-    }
-
-    // Do not leave the device in the listening state we opened ourselves
-    static void SettleAfterReport() {
-        auto& app = Application::GetInstance();
-
-        int total = 0;
-        int quiet = 0;
-        while (total < 45000) {
-            auto state = app.GetDeviceState();
-            if (state == kDeviceStateIdle) {
-                return;
-            }
-            if (state == kDeviceStateListening) {
-                quiet += 500;
-                if (quiet >= 6000) {
-                    app.StopListening();
-                    return;
-                }
-            } else {
-                quiet = 0;   // the model is speaking - keep waiting
-            }
-            vTaskDelay(pdMS_TO_TICKS(500));
-            total += 500;
-        }
-
-        // The model took longer than the budget: wait for it to finish anyway
-        for (int i = 0; i < 60 && app.GetDeviceState() == kDeviceStateSpeaking; i++) {
-            vTaskDelay(pdMS_TO_TICKS(500));
-        }
-        if (app.GetDeviceState() == kDeviceStateListening) {
-            app.StopListening();
-        }
-    }
-#endif // LIGHT_AUTO_REPORT
-
-    // Report the remembered answer of the ESP8266 to the LLM
-    static void ReportToLlm(MyBoard* self, int reply_id, const LightReport& report) {
+    // Remembered answer of the ESP8266: log it, show it on the display and
+    // keep it in NVS (saved by the caller). The MCP reply was already sent
+    // when the tool was called - switching networks kills the MQTT session,
+    // so a deferred reply would never reach the model. The answer stays
+    // available for self.light.get_last_report.
+    static void PublishLightResult(MyBoard* self, const LightReport& report) {
         std::string summary = LightSummary(report);
-        std::string mcp_result = LightMcpResult(report, summary);
         ESP_LOGI(TAG, "[LIGHT] %s", summary.c_str());
-
-        if (reply_id >= 0) {
-#if LIGHT_AUTO_REPORT
-            // The connection to the LLM died with the previous network: open the
-            // audio channel again so the remembered answer can reach the model.
-            if (!ReopenAudioChannel()) {
-                ESP_LOGW(TAG, "[LIGHT] LLM channel unavailable, answer kept for self.light.get_last_report");
-            }
-#endif
-            // Deferred MCP reply of the original tool call
-            McpServer::GetInstance().SendReply(reply_id, mcp_result);
-            ESP_LOGI(TAG, "[LIGHT] deferred MCP reply sent for id=%d", reply_id);
-#if LIGHT_AUTO_REPORT
-            // Give the model time to speak the result, then leave the
-            // conversation that was opened only for this report.
-            SettleAfterReport();
-#endif
-        }
 
         // Show the remembered answer on the device
         auto display = self->GetDisplay();
@@ -1261,7 +1163,6 @@ public:
     static void LightCommandTask(void* param) {
         auto* p = static_cast<LightCommandTaskParam*>(param);
         MyBoard* self = p->self;
-        int reply_id = p->reply_id;
         std::string action = std::move(p->action);
         delete p;
 
@@ -1311,11 +1212,11 @@ public:
         }
         SaveLightReportToNvs(report);
 
-        // 5. Report the remembered answer once the connection is back
+        // 5. Show the remembered answer once the network is back
         if (report.wifi_restored) {
-            ReportToLlm(self, reply_id, report);
+            PublishLightResult(self, report);
         } else {
-            ESP_LOGW(TAG, "[LIGHT] report kept for self.light.get_last_report (id=%d not delivered)", reply_id);
+            ESP_LOGW(TAG, "[LIGHT] WiFi not restored, answer kept for self.light.get_last_report");
             display->ShowNotification("Light: WiFi not restored", 5000);
             display->SetChatMessage("system", LightSummary(report).c_str());
         }
@@ -1325,8 +1226,10 @@ public:
         vTaskDelete(nullptr);
     }
 
-    // Starts a light command in the background; the MCP reply is deferred and
-    // sent only after the ESP8266 answered and the network is restored.
+    // Starts a light command in the background and replies to the model right
+    // away. A deferred reply cannot be used here: switching networks kills the
+    // MQTT session, so the answer would be sent with a new session_id and the
+    // server would drop it. The result is shown on the display and kept in NVS.
     ReturnValue StartLightCommand(const std::string& action) {
         auto& wifi_mgr = WifiManager::GetInstance();
 
@@ -1345,20 +1248,19 @@ public:
             return std::string("{\"error\":\"Another light command is already in progress\"}");
         }
 
-        int reply_id = McpServer::GetInstance().GetPendingToolCallId();
-        ESP_LOGI(TAG, "[LIGHT] '%s' requested, deferred reply id=%d", action.c_str(), reply_id);
+        ESP_LOGI(TAG, "[LIGHT] '%s' requested, starting background task", action.c_str());
 
-        McpServer::GetInstance().SetDeferredReply(true);
-        auto* param = new LightCommandTaskParam{this, reply_id, action};
+        auto* param = new LightCommandTaskParam{this, action};
         if (xTaskCreatePinnedToCore(LightCommandTask, "light_cmd", 8192, param, 18, nullptr, 1) != pdPASS) {
             delete param;
             light_command_running_ = false;
-            McpServer::GetInstance().SetDeferredReply(false);
             return std::string("{\"error\":\"Failed to start the light command task\"}");
         }
 
-        return std::string("Executing the light command on the " LIGHT_AP_SSID " network. "
-                           "The device will report the result after it reconnects.");
+        return std::string("The light command is running: the device joins the " LIGHT_AP_SSID
+                           " network, sends the HTTP request to the light board and then "
+                           "reconnects to the previous network. The result is shown on the "
+                           "screen and can be read back with self.light.get_last_report.");
     }
 
     void InitializeTools() {
